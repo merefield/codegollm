@@ -144,11 +144,15 @@ type model struct {
 	steering       *toolRequest
 	modelChoices   []string
 	modelCursor    int
+	width          int
 	err            error
 }
 
 type assistantMsg struct{ msg ChatMessage }
-type toolResultMsg struct{ result string }
+type toolResultMsg struct {
+	req    toolRequest
+	result string
+}
 type summaryMsg struct {
 	summary string
 	through int
@@ -202,6 +206,11 @@ func main() {
 	if session, err := loadSession(sessionPath); err == nil {
 		if len(session.Messages) > 0 {
 			messages = ensureSystemMessage(session.Messages, cfg.SystemPrompt)
+			var repaired int
+			messages, repaired = repairUnansweredToolCalls(messages)
+			if repaired > 0 {
+				logs = append(logs, logLine{Kind: "system", Text: fmt.Sprintf("repaired %d unanswered tool call(s) in saved session", repaired)})
+			}
 		}
 		summary = session.Summary
 		summaryThrough = session.SummaryThrough
@@ -455,12 +464,51 @@ func (m model) saveSession() model {
 	return m
 }
 
+func repairUnansweredToolCalls(messages []ChatMessage) ([]ChatMessage, int) {
+	repaired := 0
+	var out []ChatMessage
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+		out = append(out, msg)
+		if msg.Role != "assistant" || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		answered := map[string]bool{}
+		j := i + 1
+		for ; j < len(messages); j++ {
+			if messages[j].Role == "assistant" || messages[j].Role == "user" {
+				break
+			}
+			if messages[j].Role == "tool" && messages[j].ToolCallID != "" {
+				answered[messages[j].ToolCallID] = true
+			}
+			out = append(out, messages[j])
+		}
+		for _, call := range msg.ToolCalls {
+			if call.ID == "" || answered[call.ID] {
+				continue
+			}
+			out = append(out, ChatMessage{
+				Role:       "tool",
+				Content:    "tool call was not executed before the previous session ended",
+				ToolName:   call.Function.Name,
+				ToolCallID: call.ID,
+			})
+			repaired++
+		}
+		i = j - 1
+	}
+	return out, repaired
+}
+
 func (m model) Init() tea.Cmd {
 	return textinput.Blink
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
 	case tea.KeyMsg:
 		if m.steering != nil {
 			switch msg.String() {
@@ -475,6 +523,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Placeholder = "Ask codegollm to change code..."
 				m.busy = true
 				m.logs = append(m.logs, logLine{Kind: "user", Text: "instead of " + formatTool(req) + ": " + instruction})
+				m.messages = append(m.messages, ChatMessage{
+					Role:       "tool",
+					Content:    "tool call denied by user. Requested alternate instruction: " + instruction,
+					ToolName:   req.Name,
+					ToolCallID: req.Call.ID,
+				})
 				m.messages = append(m.messages, ChatMessage{
 					Role: "user",
 					Content: "Do not run the proposed tool call " + formatTool(req) + ". Instead: " + instruction +
@@ -585,21 +639,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m = m.saveSession()
 		if len(msg.msg.ToolCalls) > 0 {
-			req, err := m.prepareTool(msg.msg.ToolCalls[0])
-			if err != nil {
-				m.busy = true
-				rejected := reqFromCall(msg.msg.ToolCalls[0])
-				result := fmt.Sprintf("tool rejected: %s. Tool %q must use valid JSON object arguments. Raw arguments: %s", err.Error(), rejected.Name, string(msg.msg.ToolCalls[0].Function.Arguments))
-				return m, continueWithToolResult(rejected, result)
-			}
-			if req.Name == "read" || hasApproval(m.cfg.ApprovedTools, approvalKey(req)) {
-				m.busy = true
-				m.logs = append(m.logs, logLine{Kind: "tool", Text: "running " + formatTool(req)})
-				return m, runToolCmd(m.root, req)
-			}
-			m.pending = &req
-			m.logs = append(m.logs, logLine{Kind: "tool", Text: "approval requested for " + formatTool(req)})
-			return m, nil
+			return m.handleNextToolCall()
 		}
 		if shouldForceToolUse(msg.msg.Content) {
 			nudge := ChatMessage{
@@ -620,10 +660,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.maybeSummarizeCmd()
 	case toolResultMsg:
 		m.busy = true
-		toolName, toolCallID := m.lastTool()
-		m.messages = append(m.messages, ChatMessage{Role: "tool", Content: msg.result, ToolName: toolName, ToolCallID: toolCallID})
+		m.messages = append(m.messages, ChatMessage{Role: "tool", Content: msg.result, ToolName: msg.req.Name, ToolCallID: msg.req.Call.ID})
 		m.logs = append(m.logs, logLine{Kind: "tool", Text: previewContent(strings.TrimSpace(msg.result))})
 		m = m.saveSession()
+		if _, ok := m.nextUnansweredToolCall(); ok {
+			return m.handleNextToolCall()
+		}
 		return m, callModelCmd(m.cfg, m.contextMessages())
 	case summaryMsg:
 		if msg.err != nil {
@@ -669,24 +711,7 @@ func (m model) View() string {
 		start = len(m.logs) - 18
 	}
 	for _, l := range m.logs[start:] {
-		style := assistantStyle
-		label := "assistant"
-		switch l.Kind {
-		case "user":
-			style = userStyle
-			label = "you"
-		case "tool":
-			style = toolStyle
-			label = "tool"
-		case "error":
-			style = errStyle
-			label = "error"
-		case "system":
-			style = titleStyle
-			label = "system"
-		}
-		b.WriteString(style.Render(label + ": "))
-		b.WriteString(l.Text)
+		b.WriteString(m.renderLogLine(l))
 		b.WriteString("\n\n")
 	}
 
@@ -731,6 +756,94 @@ func (m model) View() string {
 	return b.String()
 }
 
+func (m model) renderLogLine(line logLine) string {
+	style := assistantStyle
+	label := "assistant"
+	switch line.Kind {
+	case "user":
+		style = userStyle
+		label = "you"
+	case "tool":
+		style = toolStyle
+		label = "tool"
+	case "error":
+		style = errStyle
+		label = "error"
+	case "system":
+		style = titleStyle
+		label = "system"
+	}
+	prefix := label + ": "
+	width := m.width
+	if width <= 0 {
+		width = 100
+	}
+	textWidth := width - len(prefix)
+	if textWidth < 20 {
+		textWidth = 20
+	}
+	wrapped := wrapText(line.Text, textWidth)
+	lines := strings.Split(wrapped, "\n")
+	var b strings.Builder
+	for i, text := range lines {
+		if i == 0 {
+			b.WriteString(style.Render(prefix))
+		} else {
+			b.WriteString(strings.Repeat(" ", len(prefix)))
+		}
+		b.WriteString(text)
+		if i < len(lines)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+func wrapText(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+	var out []string
+	for _, paragraph := range strings.Split(text, "\n") {
+		out = append(out, wrapParagraph(paragraph, width)...)
+	}
+	return strings.Join(out, "\n")
+}
+
+func wrapParagraph(text string, width int) []string {
+	if text == "" {
+		return []string{""}
+	}
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{""}
+	}
+	var lines []string
+	current := words[0]
+	for _, word := range words[1:] {
+		if len([]rune(current))+1+len([]rune(word)) <= width {
+			current += " " + word
+			continue
+		}
+		lines = append(lines, current)
+		current = word
+		for len([]rune(current)) > width {
+			runes := []rune(current)
+			lines = append(lines, string(runes[:width]))
+			current = string(runes[width:])
+		}
+	}
+	for len([]rune(current)) > width {
+		runes := []rune(current)
+		lines = append(lines, string(runes[:width]))
+		current = string(runes[width:])
+	}
+	if current != "" {
+		lines = append(lines, current)
+	}
+	return lines
+}
+
 func (m model) contextMessages() []ChatMessage {
 	recent := m.cfg.RecentHistoryMessages
 	if recent <= 0 {
@@ -750,8 +863,25 @@ func (m model) contextMessages() []ChatMessage {
 	if start < m.summaryThrough {
 		start = m.summaryThrough
 	}
+	start = toolSafeContextStart(m.messages, start)
 	context = append(context, m.messages[start:]...)
 	return context
+}
+
+func toolSafeContextStart(messages []ChatMessage, start int) int {
+	if start <= 1 || start >= len(messages) {
+		return start
+	}
+	for i := start; i >= 1; i-- {
+		msg := messages[i]
+		if msg.Role == "assistant" || msg.Role == "user" {
+			if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+				return i
+			}
+			return start
+		}
+	}
+	return start
 }
 
 func (m model) maybeSummarizeCmd() tea.Cmd {
@@ -1126,20 +1256,58 @@ func shouldForceToolUse(content string) bool {
 		(strings.Contains(text, "code") || strings.Contains(text, "file") || strings.Contains(text, "html") || strings.Contains(text, "javascript") || strings.Contains(text, "css"))
 }
 
-func (m model) lastTool() (string, string) {
-	if len(m.messages) > 0 {
-		last := m.messages[len(m.messages)-1]
-		if len(last.ToolCalls) > 0 {
-			return last.ToolCalls[0].Function.Name, last.ToolCalls[0].ID
-		}
+func (m model) handleNextToolCall() (tea.Model, tea.Cmd) {
+	call, ok := m.nextUnansweredToolCall()
+	if !ok {
+		m.busy = true
+		return m, callModelCmd(m.cfg, m.contextMessages())
 	}
-	return "", ""
+	req, err := m.prepareTool(call)
+	if err != nil {
+		m.busy = true
+		rejected := reqFromCall(call)
+		result := fmt.Sprintf("tool rejected: %s. Tool %q must use valid JSON object arguments. Raw arguments: %s", err.Error(), rejected.Name, string(call.Function.Arguments))
+		return m, continueWithToolResult(rejected, result)
+	}
+	if req.Name == "read" || hasApproval(m.cfg.ApprovedTools, approvalKey(req)) {
+		m.busy = true
+		m.logs = append(m.logs, logLine{Kind: "tool", Text: "running " + formatTool(req)})
+		return m, runToolCmd(m.root, req)
+	}
+	m.busy = false
+	m.pending = &req
+	m.logs = append(m.logs, logLine{Kind: "tool", Text: "approval requested for " + formatTool(req)})
+	return m, nil
+}
+
+func (m model) nextUnansweredToolCall() (ToolCall, bool) {
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		msg := m.messages[i]
+		if msg.Role != "assistant" || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		answered := map[string]bool{}
+		for j := i + 1; j < len(m.messages); j++ {
+			if m.messages[j].Role == "assistant" || m.messages[j].Role == "user" {
+				break
+			}
+			if m.messages[j].Role == "tool" && m.messages[j].ToolCallID != "" {
+				answered[m.messages[j].ToolCallID] = true
+			}
+		}
+		for _, call := range msg.ToolCalls {
+			if call.ID == "" || !answered[call.ID] {
+				return call, true
+			}
+		}
+		return ToolCall{}, false
+	}
+	return ToolCall{}, false
 }
 
 func continueWithToolResult(req toolRequest, result string) tea.Cmd {
 	return func() tea.Msg {
-		_ = req
-		return toolResultMsg{result: result}
+		return toolResultMsg{req: req, result: result}
 	}
 }
 
@@ -1275,21 +1443,29 @@ func callOpenAI(cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMes
 }
 
 func openAIMessages(messages []ChatMessage) []OpenAIChatMessage {
+	messages, _ = repairUnansweredToolCalls(messages)
 	out := make([]OpenAIChatMessage, 0, len(messages))
+	pendingToolCalls := map[string]bool{}
 	for _, msg := range messages {
-		if msg.Role == "tool" && msg.ToolCallID == "" {
+		if msg.Role == "tool" && (msg.ToolCallID == "" || !pendingToolCalls[msg.ToolCallID]) {
 			out = append(out, OpenAIChatMessage{
 				Role:    "user",
 				Content: "Prior tool result from " + msg.ToolName + ": " + msg.Content,
 			})
 			continue
+		} else if msg.Role == "tool" {
+			delete(pendingToolCalls, msg.ToolCallID)
 		}
 		if msg.Role == "assistant" && hasToolCallWithoutID(msg.ToolCalls) {
+			pendingToolCalls = map[string]bool{}
 			out = append(out, OpenAIChatMessage{
 				Role:    "assistant",
 				Content: formatMessageForSummary(msg),
 			})
 			continue
+		}
+		if msg.Role != "tool" {
+			pendingToolCalls = map[string]bool{}
 		}
 		converted := OpenAIChatMessage{
 			Role:       msg.Role,
@@ -1298,6 +1474,13 @@ func openAIMessages(messages []ChatMessage) []OpenAIChatMessage {
 			ToolCallID: msg.ToolCallID,
 		}
 		out = append(out, converted)
+		if msg.Role == "assistant" {
+			for _, call := range converted.ToolCalls {
+				if call.ID != "" {
+					pendingToolCalls[call.ID] = true
+				}
+			}
+		}
 	}
 	return out
 }
@@ -1450,7 +1633,7 @@ func runToolCmd(root string, req toolRequest) tea.Cmd {
 		if err != nil {
 			result = "error: " + err.Error()
 		}
-		return toolResultMsg{result: result}
+		return toolResultMsg{req: req, result: result}
 	}
 }
 

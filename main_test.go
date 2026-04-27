@@ -223,6 +223,30 @@ func TestContextMessagesUsesSummaryAndRecentWindow(t *testing.T) {
 	}
 }
 
+func TestContextMessagesDoesNotStartWithOrphanToolResult(t *testing.T) {
+	m := model{
+		cfg: Config{SystemPrompt: "system", RecentHistoryMessages: 4},
+		messages: []ChatMessage{
+			{Role: "system", Content: "system"},
+			{Role: "user", Content: "old"},
+			{Role: "assistant", ToolCalls: []ToolCall{
+				{ID: "call_1", Function: ToolFunction{Name: "write", Arguments: json.RawMessage(`{"path":"a","content":"a"}`)}},
+				{ID: "call_2", Function: ToolFunction{Name: "write", Arguments: json.RawMessage(`{"path":"b","content":"b"}`)}},
+			}},
+			{Role: "tool", ToolName: "write", ToolCallID: "call_1", Content: "wrote a"},
+			{Role: "tool", ToolName: "write", ToolCallID: "call_2", Content: "wrote b"},
+			{Role: "user", Content: "next"},
+		},
+	}
+	context := m.contextMessages()
+	if context[1].Role != "assistant" || len(context[1].ToolCalls) != 2 {
+		t.Fatalf("context should include assistant tool_calls before tool results: %#v", context)
+	}
+	if context[2].Role != "tool" || context[3].Role != "tool" {
+		t.Fatalf("context lost tool results: %#v", context)
+	}
+}
+
 func TestOpenAIMessagesNormalizesToolHistory(t *testing.T) {
 	messages := []ChatMessage{
 		{Role: "assistant", ToolCalls: []ToolCall{{Function: ToolFunction{Name: "read", Arguments: json.RawMessage(`{"path":"main.go"}`)}}}},
@@ -241,6 +265,78 @@ func TestOpenAIMessagesNormalizesToolHistory(t *testing.T) {
 	}
 	if string(got[2].ToolCalls[0].Function.Arguments)[:1] != `"` {
 		t.Fatalf("OpenAI tool arguments should be JSON string, got %s", got[2].ToolCalls[0].Function.Arguments)
+	}
+}
+
+func TestOpenAIMessagesConvertsOrphanToolWithID(t *testing.T) {
+	got := openAIMessages([]ChatMessage{
+		{Role: "tool", ToolName: "write", ToolCallID: "call_1", Content: "wrote file"},
+	})
+	if got[0].Role != "user" || !strings.Contains(got[0].Content, "Prior tool result") {
+		t.Fatalf("orphan tool should be converted to user context: %#v", got[0])
+	}
+}
+
+func TestOpenAIMessagesRepairsDeniedToolCallShape(t *testing.T) {
+	got := openAIMessages([]ChatMessage{
+		{Role: "assistant", ToolCalls: []ToolCall{
+			{ID: "call_1", Function: ToolFunction{Name: "bash", Arguments: json.RawMessage(`{"command":"deno task start"}`)}},
+		}},
+		{Role: "user", Content: "Do not run that command"},
+	})
+	if len(got) != 3 {
+		t.Fatalf("len(got) = %d, want 3: %#v", len(got), got)
+	}
+	if got[0].Role != "assistant" || len(got[0].ToolCalls) != 1 {
+		t.Fatalf("missing assistant tool call: %#v", got)
+	}
+	if got[1].Role != "tool" || got[1].ToolCallID != "call_1" {
+		t.Fatalf("missing synthetic tool response before user message: %#v", got)
+	}
+	if got[2].Role != "user" {
+		t.Fatalf("user message order changed: %#v", got)
+	}
+}
+
+func TestNextUnansweredToolCallFindsSecondCall(t *testing.T) {
+	first := ToolCall{ID: "call_1", Function: ToolFunction{Name: "write", Arguments: json.RawMessage(`{"path":"a","content":"a"}`)}}
+	second := ToolCall{ID: "call_2", Function: ToolFunction{Name: "write", Arguments: json.RawMessage(`{"path":"b","content":"b"}`)}}
+	m := model{messages: []ChatMessage{
+		{Role: "system", Content: "system"},
+		{Role: "assistant", ToolCalls: []ToolCall{first, second}},
+		{Role: "tool", ToolName: "write", ToolCallID: "call_1", Content: "wrote a"},
+	}}
+	call, ok := m.nextUnansweredToolCall()
+	if !ok {
+		t.Fatal("expected unanswered tool call")
+	}
+	if call.ID != "call_2" {
+		t.Fatalf("next call id = %q, want call_2", call.ID)
+	}
+}
+
+func TestRepairUnansweredToolCallsAddsSyntheticToolMessage(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "system"},
+		{Role: "assistant", ToolCalls: []ToolCall{
+			{ID: "call_1", Function: ToolFunction{Name: "write"}},
+			{ID: "call_2", Function: ToolFunction{Name: "write"}},
+		}},
+		{Role: "tool", ToolName: "write", ToolCallID: "call_1", Content: "wrote first"},
+		{Role: "user", Content: "carry on"},
+	}
+	repaired, count := repairUnansweredToolCalls(messages)
+	if count != 1 {
+		t.Fatalf("repaired %d calls, want 1", count)
+	}
+	if repaired[2].Role != "tool" || repaired[2].ToolCallID != "call_1" {
+		t.Fatalf("existing tool message order changed: %#v", repaired)
+	}
+	if repaired[3].Role != "tool" || repaired[3].ToolCallID != "call_2" {
+		t.Fatalf("missing synthetic tool message: %#v", repaired)
+	}
+	if repaired[4].Role != "user" {
+		t.Fatalf("user message order changed: %#v", repaired)
 	}
 }
 
@@ -264,5 +360,26 @@ func TestSessionRoundTripAndSystemPromptRefresh(t *testing.T) {
 	refreshed := ensureSystemMessage(loaded.Messages, "new system")
 	if refreshed[0].Content != "new system" || refreshed[1].Content != "hi" {
 		t.Fatalf("system prompt not refreshed: %#v", refreshed)
+	}
+}
+
+func TestRenderLogLineWrapsLongAssistantText(t *testing.T) {
+	m := model{width: 48}
+	rendered := m.renderLogLine(logLine{
+		Kind: "assistant",
+		Text: "Enhanced the Boid draw method in script.js to make each boid colored by its velocity direction.",
+	})
+	if !strings.Contains(rendered, "\n") {
+		t.Fatalf("expected wrapped output, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "velocity direction") {
+		t.Fatalf("wrapped output lost text: %q", rendered)
+	}
+	lines := strings.Split(rendered, "\n")
+	if !strings.HasPrefix(lines[0], "assistant: ") {
+		t.Fatalf("first line missing label: %q", lines[0])
+	}
+	if strings.HasPrefix(lines[1], "assistant: ") {
+		t.Fatalf("continuation line should not repeat label: %q", lines[1])
 	}
 }
