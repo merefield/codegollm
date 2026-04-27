@@ -145,21 +145,35 @@ type model struct {
 	modelChoices   []string
 	modelCursor    int
 	width          int
+	runID          int
+	cancel         context.CancelFunc
+	activeTool     *toolRequest
 	err            error
 }
 
-type assistantMsg struct{ msg ChatMessage }
+type assistantMsg struct {
+	runID int
+	msg   ChatMessage
+}
 type toolResultMsg struct {
+	runID  int
 	req    toolRequest
 	result string
 }
 type summaryMsg struct {
+	runID   int
 	summary string
 	through int
 	err     error
 }
-type modelsMsg struct{ models []string }
-type errMsg struct{ err error }
+type modelsMsg struct {
+	runID  int
+	models []string
+}
+type errMsg struct {
+	runID int
+	err   error
+}
 
 var (
 	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
@@ -535,7 +549,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						". Continue using tools as needed.",
 				})
 				m = m.saveSession()
-				return m, callModelCmd(m.cfg, m.contextMessages())
+				m, runID, ctx := m.beginRun(nil)
+				return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
 			case "esc":
 				m.pending = m.steering
 				m.steering = nil
@@ -580,13 +595,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "y", "enter":
 				req := *m.pending
 				m.pending = nil
-				m.busy = true
 				m.logs = append(m.logs, logLine{Kind: "tool", Text: "approved " + formatTool(req)})
-				return m, runToolCmd(m.root, req)
+				m, runID, ctx := m.beginRun(&req)
+				return m, runToolCmd(ctx, m.root, req, runID)
 			case "a":
 				req := *m.pending
 				m.pending = nil
-				m.busy = true
 				key := approvalKey(req)
 				if !hasApproval(m.cfg.ApprovedTools, key) {
 					m.cfg.ApprovedTools = append(m.cfg.ApprovedTools, key)
@@ -595,7 +609,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.logs = append(m.logs, logLine{Kind: "tool", Text: "approved always " + formatTool(req)})
-				return m, runToolCmd(m.root, req)
+				m, runID, ctx := m.beginRun(&req)
+				return m, runToolCmd(ctx, m.root, req, runID)
 			case "n", "esc":
 				req := *m.pending
 				m.pending = nil
@@ -613,6 +628,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
+		case "esc":
+			if m.busy {
+				return m.interruptRun(), nil
+			}
 		case "enter":
 			if m.busy {
 				return m, nil
@@ -629,9 +648,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messages = append(m.messages, ChatMessage{Role: "user", Content: prompt})
 			m.logs = append(m.logs, logLine{Kind: "user", Text: prompt})
 			m = m.saveSession()
-			return m, callModelCmd(m.cfg, m.contextMessages())
+			m, runID, ctx := m.beginRun(nil)
+			return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
 		}
 	case assistantMsg:
+		var ok bool
+		m, ok = m.finishRun(msg.runID)
+		if !ok {
+			return m, nil
+		}
 		m.busy = false
 		m.messages = append(m.messages, msg.msg)
 		if msg.msg.Content != "" {
@@ -655,10 +680,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logs = append(m.logs, logLine{Kind: "system", Text: "prompted model to continue with tools"})
 			m = m.saveSession()
 			m.busy = true
-			return m, callModelCmd(m.cfg, m.contextMessages())
+			m, runID, ctx := m.beginRun(nil)
+			return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
 		}
 		return m, m.maybeSummarizeCmd()
 	case toolResultMsg:
+		var ok bool
+		m, ok = m.finishRun(msg.runID)
+		if !ok {
+			return m, nil
+		}
 		m.busy = true
 		m.messages = append(m.messages, ChatMessage{Role: "tool", Content: msg.result, ToolName: msg.req.Name, ToolCallID: msg.req.Call.ID})
 		m.logs = append(m.logs, logLine{Kind: "tool", Text: previewContent(strings.TrimSpace(msg.result))})
@@ -666,8 +697,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if _, ok := m.nextUnansweredToolCall(); ok {
 			return m.handleNextToolCall()
 		}
-		return m, callModelCmd(m.cfg, m.contextMessages())
+		m, runID, ctx := m.beginRun(nil)
+		return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
 	case summaryMsg:
+		if msg.runID != 0 && msg.runID != m.runID {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.logs = append(m.logs, logLine{Kind: "error", Text: msg.err.Error()})
 		} else if msg.through > m.summaryThrough {
@@ -677,6 +712,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m = m.saveSession()
 		}
 	case modelsMsg:
+		var ok bool
+		m, ok = m.finishRun(msg.runID)
+		if !ok {
+			return m, nil
+		}
 		m.busy = false
 		if len(msg.models) == 0 {
 			m.logs = append(m.logs, logLine{Kind: "error", Text: "no Ollama models found"})
@@ -691,6 +731,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case errMsg:
+		var ok bool
+		m, ok = m.finishRun(msg.runID)
+		if !ok {
+			return m, nil
+		}
 		m.busy = false
 		m.err = msg.err
 		m.logs = append(m.logs, logLine{Kind: "error", Text: msg.err.Error()})
@@ -752,7 +797,11 @@ func (m model) View() string {
 
 	b.WriteString(m.input.View())
 	b.WriteString("\n")
-	b.WriteString("enter sends | ctrl+c quits")
+	if m.busy && m.pending == nil && m.steering == nil && len(m.modelChoices) == 0 {
+		b.WriteString("enter sends | esc interrupts | ctrl+c quits")
+	} else {
+		b.WriteString("enter sends | ctrl+c quits")
+	}
 	return b.String()
 }
 
@@ -896,7 +945,56 @@ func (m model) maybeSummarizeCmd() tea.Cmd {
 	messages := append([]ChatMessage(nil), m.messages[1:through]...)
 	existing := m.summary
 	cfg := m.cfg
-	return summarizeCmd(cfg, existing, messages, through)
+	ctx := context.Background()
+	return summarizeCmd(ctx, cfg, existing, messages, through, 0)
+}
+
+func (m model) beginRun(active *toolRequest) (model, int, context.Context) {
+	if m.cancel != nil {
+		m.cancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.runID++
+	m.cancel = cancel
+	m.activeTool = active
+	m.busy = true
+	return m, m.runID, ctx
+}
+
+func (m model) finishRun(runID int) (model, bool) {
+	if runID != 0 && runID != m.runID {
+		return m, false
+	}
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.activeTool = nil
+	return m, true
+}
+
+func (m model) interruptRun() model {
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.runID++
+	m.busy = false
+	if m.activeTool != nil {
+		req := *m.activeTool
+		m.messages = append(m.messages, ChatMessage{
+			Role:       "tool",
+			Content:    "tool call interrupted by user",
+			ToolName:   req.Name,
+			ToolCallID: req.Call.ID,
+		})
+		m.activeTool = nil
+		m.logs = append(m.logs, logLine{Kind: "system", Text: "interrupted " + formatTool(req)})
+		m = m.saveSession()
+		return m
+	}
+	m.logs = append(m.logs, logLine{Kind: "system", Text: "interrupted current response"})
+	return m.saveSession()
 }
 
 func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
@@ -908,9 +1006,9 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 			m.logs = append(m.logs, logLine{Kind: "system", Text: "current provider is " + m.cfg.Provider + "; set model in config.yaml"})
 			return m, nil
 		}
-		m.busy = true
 		m.logs = append(m.logs, logLine{Kind: "system", Text: "loading Ollama models..."})
-		return m, listModelsCmd(m.cfg)
+		m, runID, ctx := m.beginRun(nil)
+		return m, listModelsCmd(ctx, m.cfg, runID)
 	case "/help":
 		m.logs = append(m.logs, logLine{Kind: "system", Text: "commands: /model, /help"})
 		return m, nil
@@ -1259,20 +1357,19 @@ func shouldForceToolUse(content string) bool {
 func (m model) handleNextToolCall() (tea.Model, tea.Cmd) {
 	call, ok := m.nextUnansweredToolCall()
 	if !ok {
-		m.busy = true
-		return m, callModelCmd(m.cfg, m.contextMessages())
+		m, runID, ctx := m.beginRun(nil)
+		return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
 	}
 	req, err := m.prepareTool(call)
 	if err != nil {
-		m.busy = true
 		rejected := reqFromCall(call)
 		result := fmt.Sprintf("tool rejected: %s. Tool %q must use valid JSON object arguments. Raw arguments: %s", err.Error(), rejected.Name, string(call.Function.Arguments))
 		return m, continueWithToolResult(rejected, result)
 	}
 	if req.Name == "read" || hasApproval(m.cfg.ApprovedTools, approvalKey(req)) {
-		m.busy = true
 		m.logs = append(m.logs, logLine{Kind: "tool", Text: "running " + formatTool(req)})
-		return m, runToolCmd(m.root, req)
+		m, runID, ctx := m.beginRun(&req)
+		return m, runToolCmd(ctx, m.root, req, runID)
 	}
 	m.busy = false
 	m.pending = &req
@@ -1311,17 +1408,17 @@ func continueWithToolResult(req toolRequest, result string) tea.Cmd {
 	}
 }
 
-func callModelCmd(cfg Config, messages []ChatMessage) tea.Cmd {
+func callModelCmd(ctx context.Context, cfg Config, messages []ChatMessage, runID int) tea.Cmd {
 	return func() tea.Msg {
-		msg, err := callModel(cfg, messages, toolSchemas())
+		msg, err := callModel(ctx, cfg, messages, toolSchemas())
 		if err != nil {
-			return errMsg{err}
+			return errMsg{runID: runID, err: err}
 		}
-		return assistantMsg{msg: msg}
+		return assistantMsg{runID: runID, msg: msg}
 	}
 }
 
-func summarizeCmd(cfg Config, existing string, messages []ChatMessage, through int) tea.Cmd {
+func summarizeCmd(ctx context.Context, cfg Config, existing string, messages []ChatMessage, through int, runID int) tea.Cmd {
 	return func() tea.Msg {
 		var b strings.Builder
 		if strings.TrimSpace(existing) != "" {
@@ -1350,11 +1447,11 @@ func summarizeCmd(cfg Config, existing string, messages []ChatMessage, through i
 			},
 			{Role: "user", Content: b.String()},
 		}
-		msg, err := callModel(cfg, reqMessages, nil)
+		msg, err := callModel(ctx, cfg, reqMessages, nil)
 		if err != nil {
-			return summaryMsg{through: through, err: fmt.Errorf("summary update failed: %w", err)}
+			return summaryMsg{runID: runID, through: through, err: fmt.Errorf("summary update failed: %w", err)}
 		}
-		return summaryMsg{summary: strings.TrimSpace(msg.Content), through: through}
+		return summaryMsg{runID: runID, summary: strings.TrimSpace(msg.Content), through: through}
 	}
 }
 
@@ -1376,23 +1473,23 @@ func formatMessageForSummary(msg ChatMessage) string {
 	}
 }
 
-func callModel(cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
+func callModel(ctx context.Context, cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case "", "openai":
-		return callOpenAI(cfg, messages, tools)
+		return callOpenAI(ctx, cfg, messages, tools)
 	case "ollama":
-		return callOllama(cfg, messages, tools)
+		return callOllama(ctx, cfg, messages, tools)
 	default:
 		return ChatMessage{}, errors.New("unknown provider: " + cfg.Provider)
 	}
 }
 
-func callOpenAI(cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
+func callOpenAI(ctx context.Context, cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
 	apiKey := strings.TrimSpace(os.Getenv(cfg.OpenAIAPIKeyEnv))
 	if apiKey == "" {
 		return ChatMessage{}, fmt.Errorf("missing OpenAI API key: set %s in your shell environment", cfg.OpenAIAPIKeyEnv)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	body, err := json.Marshal(OpenAIChatRequest{
 		Model:    cfg.Model,
@@ -1515,8 +1612,8 @@ func openAIToolCalls(calls []ToolCall) []ToolCall {
 	return converted
 }
 
-func callOllama(cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+func callOllama(ctx context.Context, cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	body, err := json.Marshal(OllamaRequest{
 		Model:    cfg.Model,
@@ -1554,21 +1651,21 @@ func callOllama(cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMes
 	return out.Message, nil
 }
 
-func listModelsCmd(cfg Config) tea.Cmd {
+func listModelsCmd(ctx context.Context, cfg Config, runID int) tea.Cmd {
 	return func() tea.Msg {
-		models, err := listModelsFromCLI()
+		models, err := listModelsFromCLI(ctx)
 		if err != nil {
-			models, err = listModelsFromAPI(cfg)
+			models, err = listModelsFromAPI(ctx, cfg)
 		}
 		if err != nil {
-			return errMsg{err: err}
+			return errMsg{runID: runID, err: err}
 		}
-		return modelsMsg{models: models}
+		return modelsMsg{runID: runID, models: models}
 	}
 }
 
-func listModelsFromCLI() ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func listModelsFromCLI(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ollama", "list")
 	out, err := cmd.Output()
@@ -1592,8 +1689,8 @@ func listModelsFromCLI() ([]string, error) {
 	return models, nil
 }
 
-func listModelsFromAPI(cfg Config) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func listModelsFromAPI(ctx context.Context, cfg Config) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cfg.OllamaURL, "/")+"/api/tags", nil)
 	if err != nil {
@@ -1627,17 +1724,20 @@ func listModelsFromAPI(cfg Config) ([]string, error) {
 	return models, nil
 }
 
-func runToolCmd(root string, req toolRequest) tea.Cmd {
+func runToolCmd(ctx context.Context, root string, req toolRequest, runID int) tea.Cmd {
 	return func() tea.Msg {
-		result, err := runTool(root, req)
+		result, err := runTool(ctx, root, req)
 		if err != nil {
 			result = "error: " + err.Error()
 		}
-		return toolResultMsg{req: req, result: result}
+		return toolResultMsg{runID: runID, req: req, result: result}
 	}
 }
 
-func runTool(root string, req toolRequest) (string, error) {
+func runTool(ctx context.Context, root string, req toolRequest) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	switch req.Name {
 	case "read":
 		data, err := os.ReadFile(filepath.Join(root, req.Args["path"]))
@@ -1675,7 +1775,7 @@ func runTool(root string, req toolRequest) (string, error) {
 		}
 		return "edited " + req.Args["path"], nil
 	case "bash":
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "bash", "-lc", req.Args["command"])
 		cmd.Dir = root

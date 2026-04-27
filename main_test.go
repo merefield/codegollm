@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestCleanPathRejectsEscapes(t *testing.T) {
@@ -381,5 +383,54 @@ func TestRenderLogLineWrapsLongAssistantText(t *testing.T) {
 	}
 	if strings.HasPrefix(lines[1], "assistant: ") {
 		t.Fatalf("continuation line should not repeat label: %q", lines[1])
+	}
+}
+
+func TestEscInterruptsBusyRun(t *testing.T) {
+	m := model{sessionPath: filepath.Join(t.TempDir(), ".codegollm", "session.json")}
+	m, runID, _ := m.beginRun(nil)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd != nil {
+		t.Fatal("interrupt should not return a command")
+	}
+	got := updated.(model)
+	if got.busy {
+		t.Fatal("model should no longer be busy")
+	}
+	if got.runID == runID {
+		t.Fatal("run id should advance so stale messages are ignored")
+	}
+	if len(got.logs) == 0 || !strings.Contains(got.logs[len(got.logs)-1].Text, "interrupted") {
+		t.Fatalf("missing interrupt log: %#v", got.logs)
+	}
+}
+
+func TestEscInterruptsRunningToolWithToolResponse(t *testing.T) {
+	req := toolRequest{
+		Call: ToolCall{ID: "call_1", Function: ToolFunction{Name: "bash"}},
+		Name: "bash",
+		Args: map[string]string{"command": "sleep 60"},
+	}
+	m := model{
+		sessionPath: filepath.Join(t.TempDir(), ".codegollm", "session.json"),
+		messages: []ChatMessage{
+			{Role: "system", Content: "system"},
+			{Role: "assistant", ToolCalls: []ToolCall{req.Call}},
+		},
+	}
+	m, _, _ = m.beginRun(&req)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(model)
+	if got.busy {
+		t.Fatal("model should no longer be busy")
+	}
+	if len(got.messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3: %#v", len(got.messages), got.messages)
+	}
+	tool := got.messages[2]
+	if tool.Role != "tool" || tool.ToolCallID != "call_1" || !strings.Contains(tool.Content, "interrupted") {
+		t.Fatalf("missing interrupted tool response: %#v", tool)
 	}
 }
