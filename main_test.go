@@ -752,6 +752,33 @@ func TestParseResponsesStreamTextDeltas(t *testing.T) {
 	}
 }
 
+func TestResponsesInputIncludesEmptyToolOutput(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "system"},
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "call_1",
+			Function: ToolFunction{
+				Name:      "bash",
+				Arguments: json.RawMessage(`{"command":"true"}`),
+			},
+		}}},
+		{Role: "tool", ToolName: "bash", ToolCallID: "call_1", Content: ""},
+	}
+	body, err := json.Marshal(responsesRequest{Model: "gpt-5", Input: responsesInput(messages)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"type":"function_call_output"`) {
+		t.Fatalf("missing function call output item: %s", body)
+	}
+	if !strings.Contains(string(body), `"output":""`) {
+		t.Fatalf("empty tool output was omitted: %s", body)
+	}
+	if strings.Contains(string(body), `"type":"message","role":"user","output"`) {
+		t.Fatalf("message input included output field: %s", body)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -1229,6 +1256,32 @@ func TestEscInterruptsBusyRun(t *testing.T) {
 	}
 	if len(got.logs) == 0 || !strings.Contains(got.logs[len(got.logs)-1].Text, "interrupted") {
 		t.Fatalf("missing interrupt log: %#v", got.logs)
+	}
+}
+
+func TestWorkingTickAnimatesOnlyCurrentBusyRun(t *testing.T) {
+	m := model{}
+	m, runID, _ := m.beginRun(nil)
+	if m.workingText() != "working   " {
+		t.Fatalf("initial working text = %q", m.workingText())
+	}
+
+	updated, cmd := m.Update(workingTickMsg{runID: runID})
+	if cmd == nil {
+		t.Fatal("current busy tick should schedule another tick")
+	}
+	got := updated.(model)
+	if got.workingFrame != 1 || got.workingText() != "working.  " {
+		t.Fatalf("working frame=%d text=%q", got.workingFrame, got.workingText())
+	}
+
+	updated, cmd = got.Update(workingTickMsg{runID: runID + 1})
+	if cmd != nil {
+		t.Fatal("stale tick should not schedule another tick")
+	}
+	got = updated.(model)
+	if got.workingFrame != 1 {
+		t.Fatalf("stale tick changed frame to %d", got.workingFrame)
 	}
 }
 

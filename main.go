@@ -192,7 +192,7 @@ type responsesInputItem struct {
 	CallID    string                 `json:"call_id,omitempty"`
 	Name      string                 `json:"name,omitempty"`
 	Arguments string                 `json:"arguments,omitempty"`
-	Output    string                 `json:"output,omitempty"`
+	Output    *string                `json:"output,omitempty"`
 }
 
 type responsesContentPart struct {
@@ -277,6 +277,7 @@ type model struct {
 	summaryThrough   int
 	logs             []logLine
 	busy             bool
+	workingFrame     int
 	pending          *toolRequest
 	steering         *toolRequest
 	modelChoices     []string
@@ -324,6 +325,9 @@ type errMsg struct {
 	runID        int
 	err          error
 	contextRetry bool
+}
+type workingTickMsg struct {
+	runID int
 }
 
 var (
@@ -1215,11 +1219,8 @@ func completeChatGPTLogin(ctx context.Context, cfg Config, login oauthLogin) (st
 		return "", err
 	}
 	profile := profileFromOAuthTokens(AuthProfile{}, tokens)
-	var apiKeyErr error
 	if apiKey, err := obtainChatGPTAPIKey(ctx, cfg, profile.IDToken); err == nil && apiKey != "" {
 		profile.APIKey = apiKey
-	} else if err != nil {
-		apiKeyErr = err
 	}
 	store, err := loadAuthProfiles()
 	if err != nil {
@@ -1231,10 +1232,7 @@ func completeChatGPTLogin(ctx context.Context, cfg Config, login oauthLogin) (st
 	}
 	msg := fmt.Sprintf("logged in ChatGPT profile %s using account %s", login.ProfileID, emptyDash(profile.AccountID))
 	if profile.APIKey == "" {
-		msg += "; generated API key unavailable, using ChatGPT Responses backend"
-		if apiKeyErr != nil {
-			msg += ": " + apiKeyErr.Error()
-		}
+		msg += "; using ChatGPT Responses backend"
 	}
 	return msg, nil
 }
@@ -1446,11 +1444,23 @@ func (m model) Init() tea.Cmd {
 	return textinput.Blink
 }
 
+func workingTickCmd(runID int) tea.Cmd {
+	return tea.Tick(180*time.Millisecond, func(time.Time) tea.Msg {
+		return workingTickMsg{runID: runID}
+	})
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case workingTickMsg:
+		if !m.busy || msg.runID != m.runID {
+			return m, nil
+		}
+		m.workingFrame++
+		return m, workingTickCmd(m.runID)
 	case tea.KeyMsg:
 		if m.steering != nil {
 			switch msg.String() {
@@ -1478,7 +1488,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				m = m.saveSession()
 				m, runID, ctx := m.beginRun(nil)
-				return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
+				return m, tea.Batch(callModelCmd(ctx, m.cfg, m.contextMessages(), runID), workingTickCmd(runID))
 			case "esc":
 				m.pending = m.steering
 				m.steering = nil
@@ -1548,7 +1558,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pending = nil
 				m.logs = append(m.logs, logLine{Kind: "tool", Text: "approved " + formatTool(req)})
 				m, runID, ctx := m.beginRun(&req)
-				return m, runToolCmd(ctx, m.root, req, runID)
+				return m, tea.Batch(runToolCmd(ctx, m.root, req, runID), workingTickCmd(runID))
 			case "a":
 				req := *m.pending
 				m.pending = nil
@@ -1561,7 +1571,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.logs = append(m.logs, logLine{Kind: "tool", Text: "approved always " + formatTool(req)})
 				m, runID, ctx := m.beginRun(&req)
-				return m, runToolCmd(ctx, m.root, req, runID)
+				return m, tea.Batch(runToolCmd(ctx, m.root, req, runID), workingTickCmd(runID))
 			case "n", "esc":
 				req := *m.pending
 				m.pending = nil
@@ -1614,7 +1624,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logs = append(m.logs, logLine{Kind: "user", Text: prompt})
 			m = m.saveSession()
 			m, runID, ctx := m.beginRun(nil)
-			return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
+			return m, tea.Batch(callModelCmd(ctx, m.cfg, m.contextMessages(), runID), workingTickCmd(runID))
 		}
 	case assistantMsg:
 		var ok bool
@@ -1646,7 +1656,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m = m.saveSession()
 			m.busy = true
 			m, runID, ctx := m.beginRun(nil)
-			return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
+			return m, tea.Batch(callModelCmd(ctx, m.cfg, m.contextMessages(), runID), workingTickCmd(runID))
 		}
 		return m, m.maybeSummarizeCmd()
 	case toolResultMsg:
@@ -1664,7 +1674,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleNextToolCall()
 		}
 		m, runID, ctx := m.beginRun(nil)
-		return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
+		return m, tea.Batch(callModelCmd(ctx, m.cfg, m.contextMessages(), runID), workingTickCmd(runID))
 	case summaryMsg:
 		if msg.runID != 0 && msg.runID != m.runID {
 			return m, nil
@@ -1723,7 +1733,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logs = append(m.logs, logLine{Kind: "system", Text: "context exceeded selected model; retrying with compact recent history"})
 			m.busy = true
 			m, runID, ctx := m.beginRun(nil)
-			return m, callModelCmdWithRetryFlag(ctx, m.cfg, m.contextMessagesWithRecent(2), runID, true)
+			return m, tea.Batch(callModelCmdWithRetryFlag(ctx, m.cfg, m.contextMessagesWithRecent(2), runID, true), workingTickCmd(runID))
 		}
 		m.busy = false
 		m.err = msg.err
@@ -1800,7 +1810,7 @@ func (m model) View() string {
 		b.WriteString(boxStyle.Render(list.String()))
 		b.WriteString("\n\n")
 	} else if m.busy {
-		b.WriteString(toolStyle.Render("working..."))
+		b.WriteString(toolStyle.Render(m.workingText()))
 		b.WriteString("\n\n")
 	}
 
@@ -1901,6 +1911,11 @@ func (m model) historyNext() model {
 	m.input.SetValue(m.promptDraft)
 	m.promptDraft = ""
 	return m
+}
+
+func (m model) workingText() string {
+	frames := []string{"working   ", "working.  ", "working.. ", "working..."}
+	return frames[m.workingFrame%len(frames)]
 }
 
 func (m model) modelPageSize() int {
@@ -2086,6 +2101,7 @@ func (m model) beginRun(active *toolRequest) (model, int, context.Context) {
 	m.cancel = cancel
 	m.activeTool = active
 	m.busy = true
+	m.workingFrame = 0
 	return m, m.runID, ctx
 }
 
@@ -2188,7 +2204,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 			_ = openBrowser(login.AuthURL)
 			m.logs = append(m.logs, logLine{Kind: "system", Text: "opened ChatGPT login; if no browser appears, open this URL: " + login.AuthURL})
 			m, runID, ctx := m.beginRun(nil)
-			return m, chatGPTLoginCmd(ctx, m.cfg, login, runID)
+			return m, tea.Batch(chatGPTLoginCmd(ctx, m.cfg, login, runID), workingTickCmd(runID))
 		default:
 			m.logs = append(m.logs, logLine{Kind: "error", Text: "unknown login provider: " + fields[1]})
 			return m, nil
@@ -2236,7 +2252,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 			m.logs = append(m.logs, logLine{Kind: "system", Text: "loading curated models for " + providerName(m.cfg) + "..."})
 		}
 		m, runID, ctx := m.beginRun(nil)
-		return m, listModelsCmd(ctx, m.cfg, runID, allModels)
+		return m, tea.Batch(listModelsCmd(ctx, m.cfg, runID, allModels), workingTickCmd(runID))
 	case "/reasoning":
 		if len(fields) < 2 {
 			m.logs = append(m.logs, logLine{Kind: "system", Text: "reasoning: " + m.cfg.ReasoningLevel + " | usage: /reasoning none|minimal|low|medium|high|xhigh"})
@@ -2655,7 +2671,7 @@ func (m model) handleNextToolCall() (tea.Model, tea.Cmd) {
 	call, ok := m.nextUnansweredToolCall()
 	if !ok {
 		m, runID, ctx := m.beginRun(nil)
-		return m, callModelCmd(ctx, m.cfg, m.contextMessages(), runID)
+		return m, tea.Batch(callModelCmd(ctx, m.cfg, m.contextMessages(), runID), workingTickCmd(runID))
 	}
 	req, err := m.prepareTool(call)
 	if err != nil {
@@ -2666,7 +2682,7 @@ func (m model) handleNextToolCall() (tea.Model, tea.Cmd) {
 	if req.Name == "read" || hasApproval(m.cfg.ApprovedTools, approvalKey(req)) {
 		m.logs = append(m.logs, logLine{Kind: "tool", Text: "running " + formatTool(req)})
 		m, runID, ctx := m.beginRun(&req)
-		return m, runToolCmd(ctx, m.root, req, runID)
+		return m, tea.Batch(runToolCmd(ctx, m.root, req, runID), workingTickCmd(runID))
 	}
 	m.busy = false
 	m.pending = &req
@@ -2957,7 +2973,7 @@ func responsesInput(messages []ChatMessage) []responsesInputItem {
 				continue
 			}
 			delete(pendingToolCalls, msg.ToolCallID)
-			out = append(out, responsesInputItem{Type: "function_call_output", CallID: msg.ToolCallID, Output: msg.Content})
+			out = append(out, responsesInputItem{Type: "function_call_output", CallID: msg.ToolCallID, Output: stringPtr(msg.Content)})
 		case "assistant":
 			if strings.TrimSpace(msg.Content) != "" {
 				out = append(out, responsesMessageItem("assistant", msg.Content))
@@ -2984,6 +3000,10 @@ func responsesInput(messages []ChatMessage) []responsesInputItem {
 		}
 	}
 	return out
+}
+
+func stringPtr(value string) *string {
+	return &value
 }
 
 func responsesMessageItem(role, text string) responsesInputItem {
