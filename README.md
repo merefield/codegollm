@@ -11,6 +11,14 @@ It exposes four model tools:
 
 File tools are constrained to the directory where `codegollm` is launched, or below it. Bash commands run with that directory as their working directory and require approval.
 
+Prompt controls:
+
+- `Enter`: send the current prompt.
+- `Up` / `Down`: navigate prompts sent during the current run.
+- `Ctrl+U`: clear the current prompt.
+- `Esc`: interrupt an active model response.
+- `Ctrl+C`: quit.
+
 Approval controls:
 
 - `y` or `Enter`: approve once.
@@ -92,6 +100,12 @@ ollama_url: http://localhost:11434
 
 ```bash
 go run .
+```
+
+To rebuild the local binary:
+
+```bash
+go build -o codegollm .
 ```
 
 Edit `config.yaml` to change the model, Ollama URL, or system prompt. Shell flags can override runtime behaviour without saving config:

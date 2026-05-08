@@ -32,6 +32,8 @@ const (
 	configFile                  = "config.yaml"
 	sessionFile                 = ".codegollm/session.json"
 	authProfilesFile            = "auth-profiles.json"
+	maxToolResultBytes          = 1024 * 1024
+	maxContextToolResultBytes   = 64 * 1024
 	defaultAuthProfile          = "openai-api-key:default"
 	defaultChatGPTAuthProfile   = "openai-codex:default"
 	defaultChatGPTIssuer        = "https://auth.openai.com"
@@ -267,6 +269,9 @@ type model struct {
 	sessionPath      string
 	root             string
 	input            textinput.Model
+	promptHistory    []string
+	promptHistoryPos int
+	promptDraft      string
 	messages         []ChatMessage
 	summary          string
 	summaryThrough   int
@@ -316,8 +321,9 @@ type authMsg struct {
 	err   error
 }
 type errMsg struct {
-	runID int
-	err   error
+	runID        int
+	err          error
+	contextRetry bool
 }
 
 var (
@@ -385,15 +391,16 @@ func main() {
 	}
 
 	m := model{
-		cfg:            cfg,
-		configPath:     configPath,
-		sessionPath:    sessionPath,
-		root:           root,
-		input:          ti,
-		messages:       messages,
-		summary:        summary,
-		summaryThrough: summaryThrough,
-		logs:           logs,
+		cfg:              cfg,
+		configPath:       configPath,
+		sessionPath:      sessionPath,
+		root:             root,
+		input:            ti,
+		promptHistoryPos: -1,
+		messages:         messages,
+		summary:          summary,
+		summaryThrough:   summaryThrough,
+		logs:             logs,
 	}
 	m = m.saveSession()
 
@@ -1576,6 +1583,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.busy {
 				return m.interruptRun(), nil
 			}
+		case "ctrl+u":
+			m.input.SetValue("")
+			m.promptHistoryPos = -1
+			m.promptDraft = ""
+			return m, nil
+		case "up":
+			if !m.busy {
+				return m.historyPrev(), nil
+			}
+		case "down":
+			if !m.busy {
+				return m.historyNext(), nil
+			}
 		case "enter":
 			if m.busy {
 				return m, nil
@@ -1584,6 +1604,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if prompt == "" {
 				return m, nil
 			}
+			m = m.addPromptHistory(prompt)
 			m.input.SetValue("")
 			if strings.HasPrefix(prompt, "/") {
 				return m.handleSlashCommand(prompt)
@@ -1635,6 +1656,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.busy = true
+		msg.result = truncateToolResult(msg.result)
 		m.messages = append(m.messages, ChatMessage{Role: "tool", Content: msg.result, ToolName: msg.req.Name, ToolCallID: msg.req.Call.ID})
 		m.logs = append(m.logs, logLine{Kind: "tool", Text: previewContent(strings.TrimSpace(msg.result))})
 		m = m.saveSession()
@@ -1696,6 +1718,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m, ok = m.finishRun(msg.runID)
 		if !ok {
 			return m, nil
+		}
+		if isContextWindowError(msg.err) && !msg.contextRetry {
+			m.logs = append(m.logs, logLine{Kind: "system", Text: "context exceeded selected model; retrying with compact recent history"})
+			m.busy = true
+			m, runID, ctx := m.beginRun(nil)
+			return m, callModelCmdWithRetryFlag(ctx, m.cfg, m.contextMessagesWithRecent(2), runID, true)
 		}
 		m.busy = false
 		m.err = msg.err
@@ -1781,7 +1809,7 @@ func (m model) View() string {
 	if m.busy && m.pending == nil && m.steering == nil && len(m.modelChoices) == 0 {
 		b.WriteString("enter sends | esc interrupts | ctrl+c quits")
 	} else {
-		b.WriteString("enter sends | ctrl+c quits")
+		b.WriteString("enter sends | up/down history | ctrl+u clears | ctrl+c quits")
 	}
 	return b.String()
 }
@@ -1827,6 +1855,52 @@ func (m model) renderLogLine(line logLine) string {
 		}
 	}
 	return b.String()
+}
+
+func (m model) addPromptHistory(prompt string) model {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return m
+	}
+	if len(m.promptHistory) == 0 || m.promptHistory[len(m.promptHistory)-1] != prompt {
+		m.promptHistory = append(m.promptHistory, prompt)
+	}
+	const maxPromptHistory = 100
+	if len(m.promptHistory) > maxPromptHistory {
+		m.promptHistory = append([]string(nil), m.promptHistory[len(m.promptHistory)-maxPromptHistory:]...)
+	}
+	m.promptHistoryPos = -1
+	m.promptDraft = ""
+	return m
+}
+
+func (m model) historyPrev() model {
+	if len(m.promptHistory) == 0 {
+		return m
+	}
+	if m.promptHistoryPos == -1 {
+		m.promptDraft = m.input.Value()
+		m.promptHistoryPos = len(m.promptHistory) - 1
+	} else if m.promptHistoryPos > 0 {
+		m.promptHistoryPos--
+	}
+	m.input.SetValue(m.promptHistory[m.promptHistoryPos])
+	return m
+}
+
+func (m model) historyNext() model {
+	if len(m.promptHistory) == 0 || m.promptHistoryPos == -1 {
+		return m
+	}
+	if m.promptHistoryPos < len(m.promptHistory)-1 {
+		m.promptHistoryPos++
+		m.input.SetValue(m.promptHistory[m.promptHistoryPos])
+		return m
+	}
+	m.promptHistoryPos = -1
+	m.input.SetValue(m.promptDraft)
+	m.promptDraft = ""
+	return m
 }
 
 func (m model) modelPageSize() int {
@@ -1935,6 +2009,13 @@ func (m model) contextMessages() []ChatMessage {
 	if recent <= 0 {
 		recent = 10
 	}
+	return m.contextMessagesWithRecent(recent)
+}
+
+func (m model) contextMessagesWithRecent(recent int) []ChatMessage {
+	if recent <= 0 {
+		recent = 2
+	}
 	context := []ChatMessage{{Role: "system", Content: m.cfg.SystemPrompt}}
 	if strings.TrimSpace(m.summary) != "" {
 		context = append(context, ChatMessage{
@@ -1950,8 +2031,18 @@ func (m model) contextMessages() []ChatMessage {
 		start = m.summaryThrough
 	}
 	start = toolSafeContextStart(m.messages, start)
-	context = append(context, m.messages[start:]...)
+	context = append(context, truncateToolMessagesForContext(m.messages[start:])...)
 	return context
+}
+
+func truncateToolMessagesForContext(messages []ChatMessage) []ChatMessage {
+	out := append([]ChatMessage(nil), messages...)
+	for i := range out {
+		if out[i].Role == "tool" {
+			out[i].Content = truncateWithMiddle(out[i].Content, maxContextToolResultBytes, "tool output")
+		}
+	}
+	return out
 }
 
 func toolSafeContextStart(messages []ChatMessage, start int) int {
@@ -2371,6 +2462,27 @@ func previewContent(s string) string {
 	return s
 }
 
+func truncateToolResult(s string) string {
+	return truncateWithMiddle(s, maxToolResultBytes, "tool output")
+}
+
+func truncateWithMiddle(s string, maxBytes int, label string) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	headBytes := maxBytes / 2
+	tailBytes := maxBytes - headBytes
+	if headBytes > len(s) {
+		headBytes = len(s)
+	}
+	if tailBytes > len(s)-headBytes {
+		tailBytes = len(s) - headBytes
+	}
+	head := s[:headBytes]
+	tail := s[len(s)-tailBytes:]
+	return fmt.Sprintf("%s\n... %s truncated from %d bytes to %d bytes; showing start and end only ...\n%s", head, label, len(s), maxBytes, tail)
+}
+
 func (m model) writePreviewDiff(path, content string) string {
 	current, err := os.ReadFile(filepath.Join(m.root, path))
 	if err != nil {
@@ -2528,6 +2640,17 @@ func shouldForceToolUse(content string) bool {
 		(strings.Contains(text, "code") || strings.Contains(text, "file") || strings.Contains(text, "html") || strings.Contains(text, "javascript") || strings.Contains(text, "css"))
 }
 
+func isContextWindowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "context window") ||
+		strings.Contains(text, "context length") ||
+		strings.Contains(text, "input exceeds") ||
+		strings.Contains(text, "maximum context")
+}
+
 func (m model) handleNextToolCall() (tea.Model, tea.Cmd) {
 	call, ok := m.nextUnansweredToolCall()
 	if !ok {
@@ -2583,10 +2706,14 @@ func continueWithToolResult(req toolRequest, result string) tea.Cmd {
 }
 
 func callModelCmd(ctx context.Context, cfg Config, messages []ChatMessage, runID int) tea.Cmd {
+	return callModelCmdWithRetryFlag(ctx, cfg, messages, runID, false)
+}
+
+func callModelCmdWithRetryFlag(ctx context.Context, cfg Config, messages []ChatMessage, runID int, contextRetry bool) tea.Cmd {
 	return func() tea.Msg {
 		msg, err := callModel(ctx, cfg, messages, toolSchemas())
 		if err != nil {
-			return errMsg{runID: runID, err: err}
+			return errMsg{runID: runID, err: err, contextRetry: contextRetry}
 		}
 		return assistantMsg{runID: runID, msg: msg}
 	}
@@ -3542,6 +3669,7 @@ func runToolCmd(ctx context.Context, root string, req toolRequest, runID int) te
 		if err != nil {
 			result = "error: " + err.Error()
 		}
+		result = truncateToolResult(result)
 		return toolResultMsg{runID: runID, req: req, result: result}
 	}
 }
