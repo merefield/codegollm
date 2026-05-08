@@ -752,6 +752,33 @@ func TestParseResponsesStreamTextDeltas(t *testing.T) {
 	}
 }
 
+func TestResponsesInputIncludesEmptyToolOutput(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "system"},
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "call_1",
+			Function: ToolFunction{
+				Name:      "bash",
+				Arguments: json.RawMessage(`{"command":"true"}`),
+			},
+		}}},
+		{Role: "tool", ToolName: "bash", ToolCallID: "call_1", Content: ""},
+	}
+	body, err := json.Marshal(responsesRequest{Model: "gpt-5", Input: responsesInput(messages)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"type":"function_call_output"`) {
+		t.Fatalf("missing function call output item: %s", body)
+	}
+	if !strings.Contains(string(body), `"output":""`) {
+		t.Fatalf("empty tool output was omitted: %s", body)
+	}
+	if strings.Contains(string(body), `"type":"message","role":"user","output"`) {
+		t.Fatalf("message input included output field: %s", body)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {

@@ -192,7 +192,7 @@ type responsesInputItem struct {
 	CallID    string                 `json:"call_id,omitempty"`
 	Name      string                 `json:"name,omitempty"`
 	Arguments string                 `json:"arguments,omitempty"`
-	Output    string                 `json:"output,omitempty"`
+	Output    *string                `json:"output,omitempty"`
 }
 
 type responsesContentPart struct {
@@ -1215,11 +1215,8 @@ func completeChatGPTLogin(ctx context.Context, cfg Config, login oauthLogin) (st
 		return "", err
 	}
 	profile := profileFromOAuthTokens(AuthProfile{}, tokens)
-	var apiKeyErr error
 	if apiKey, err := obtainChatGPTAPIKey(ctx, cfg, profile.IDToken); err == nil && apiKey != "" {
 		profile.APIKey = apiKey
-	} else if err != nil {
-		apiKeyErr = err
 	}
 	store, err := loadAuthProfiles()
 	if err != nil {
@@ -1231,10 +1228,7 @@ func completeChatGPTLogin(ctx context.Context, cfg Config, login oauthLogin) (st
 	}
 	msg := fmt.Sprintf("logged in ChatGPT profile %s using account %s", login.ProfileID, emptyDash(profile.AccountID))
 	if profile.APIKey == "" {
-		msg += "; generated API key unavailable, using ChatGPT Responses backend"
-		if apiKeyErr != nil {
-			msg += ": " + apiKeyErr.Error()
-		}
+		msg += "; using ChatGPT Responses backend"
 	}
 	return msg, nil
 }
@@ -2957,7 +2951,7 @@ func responsesInput(messages []ChatMessage) []responsesInputItem {
 				continue
 			}
 			delete(pendingToolCalls, msg.ToolCallID)
-			out = append(out, responsesInputItem{Type: "function_call_output", CallID: msg.ToolCallID, Output: msg.Content})
+			out = append(out, responsesInputItem{Type: "function_call_output", CallID: msg.ToolCallID, Output: stringPtr(msg.Content)})
 		case "assistant":
 			if strings.TrimSpace(msg.Content) != "" {
 				out = append(out, responsesMessageItem("assistant", msg.Content))
@@ -2984,6 +2978,10 @@ func responsesInput(messages []ChatMessage) []responsesInputItem {
 		}
 	}
 	return out
+}
+
+func stringPtr(value string) *string {
+	return &value
 }
 
 func responsesMessageItem(role, text string) responsesInputItem {
