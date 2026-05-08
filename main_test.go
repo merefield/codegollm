@@ -1259,6 +1259,32 @@ func TestEscInterruptsBusyRun(t *testing.T) {
 	}
 }
 
+func TestWorkingTickAnimatesOnlyCurrentBusyRun(t *testing.T) {
+	m := model{}
+	m, runID, _ := m.beginRun(nil)
+	if m.workingText() != "working   " {
+		t.Fatalf("initial working text = %q", m.workingText())
+	}
+
+	updated, cmd := m.Update(workingTickMsg{runID: runID})
+	if cmd == nil {
+		t.Fatal("current busy tick should schedule another tick")
+	}
+	got := updated.(model)
+	if got.workingFrame != 1 || got.workingText() != "working.  " {
+		t.Fatalf("working frame=%d text=%q", got.workingFrame, got.workingText())
+	}
+
+	updated, cmd = got.Update(workingTickMsg{runID: runID + 1})
+	if cmd != nil {
+		t.Fatal("stale tick should not schedule another tick")
+	}
+	got = updated.(model)
+	if got.workingFrame != 1 {
+		t.Fatalf("stale tick changed frame to %d", got.workingFrame)
+	}
+}
+
 func TestEscInterruptsRunningToolWithToolResponse(t *testing.T) {
 	req := toolRequest{
 		Call: ToolCall{ID: "call_1", Function: ToolFunction{Name: "bash"}},

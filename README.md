@@ -1,6 +1,6 @@
 # CodeGollm
 
-`codegollm` is a minimal Go/Bubble Tea coding TUI backed by OpenAI Chat Completions by default, with optional Ollama support.
+`codegollm` is a minimal Go/Bubble Tea coding TUI. It supports OpenAI API-key auth, ChatGPT OAuth via the ChatGPT/Codex Responses backend, and local Ollama models.
 
 It exposes four model tools:
 
@@ -19,6 +19,8 @@ Prompt controls:
 - `Esc`: interrupt an active model response.
 - `Ctrl+C`: quit.
 
+While a model call, tool run, model list, or login flow is active, the `working...` indicator animates.
+
 Approval controls:
 
 - `y` or `Enter`: approve once.
@@ -31,7 +33,7 @@ Slash commands:
 - `/login openai-api-key [profile] [env]` uses an OpenAI API key from an environment variable.
 - `/login openai-codex [profile] [workspace_id]` logs in with a ChatGPT account and stores a local auth profile.
 - `/logout [profile]` removes an auth profile.
-- `/model` lists a curated, scrollable set of available models for the active provider. For OpenAI and ChatGPT auth, it calls `/v1/models`, filters out non-chat models, and puts the preferred model first.
+- `/model` lists a curated, scrollable set of available models for the active provider. OpenAI API-key auth calls `/v1/models` and filters out non-chat models. ChatGPT auth uses a built-in Codex-compatible model list.
 - `/model all` opens the full scrollable model list.
 - `/model auto` saves `model: auto`, so each OpenAI/ChatGPT request uses the first available entry from `preferred_models`.
 - `/reasoning [none|minimal|low|medium|high|xhigh]` shows or saves the OpenAI reasoning level.
@@ -41,8 +43,8 @@ Slash commands:
 ## Requirements
 
 - Go 1.22+
-- An OpenAI API key in your shell environment
-- A tool-capable model, defaulting to `gpt-4.1-mini`
+- An OpenAI API key in your shell environment, or a ChatGPT login through `/login openai-codex`
+- A tool-capable model, defaulting to `gpt-4.1-mini` for OpenAI API-key auth
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -86,7 +88,7 @@ auth_profile: openai-codex:default
 chatgpt_workspace_id: org-...
 ```
 
-ChatGPT login uses the ChatGPT/Codex Responses backend with the OAuth access token. If the optional generated API-key exchange fails, CodeGollm keeps the ChatGPT profile and uses Responses directly.
+ChatGPT login uses the ChatGPT/Codex Responses backend with the OAuth access token. If the optional generated API-key exchange fails, CodeGollm keeps the ChatGPT profile and uses Responses directly. The login success message reports this as `using ChatGPT Responses backend`.
 
 For Ollama, change the provider and model:
 
@@ -117,9 +119,9 @@ codegollm --reasoning low --no-fast
 
 Set `model: auto` to choose the first available entry from `preferred_models` at request time. With an explicit model name, CodeGollm uses that model until you change it. The `/model` picker also uses `preferred_models` to mark and order the recommended OpenAI/ChatGPT choice.
 
-`reasoning_level` is sent as OpenAI `reasoning_effort` for reasoning-capable Chat Completions models such as GPT-5, o-series, and Codex-family models. It is omitted for non-reasoning models such as GPT-4.1. `none` is omitted for older reasoning models that do not support it, and unsupported `xhigh` requests are downgraded to `high`. `fast: true` biases automatic model selection toward `mini` or `nano` models rather than sending provider-specific latency controls that may not be available on every account.
+`reasoning_level` is sent as OpenAI `reasoning_effort` for reasoning-capable API-key models, and as Responses `reasoning.effort` for ChatGPT/Codex Responses calls. It is omitted for non-reasoning models such as GPT-4.1. `none` is omitted for older reasoning models that do not support it, and unsupported `xhigh` requests are downgraded to `high`. `fast: true` biases automatic model selection toward `mini` or `nano` models rather than sending provider-specific latency controls that may not be available on every account.
 
-`recent_history_messages` controls how many recent chat/tool messages are sent verbatim. Older messages are folded into a running summary so the agent keeps durable context without sending the whole session every turn. The default is `10`.
+`recent_history_messages` controls how many recent chat/tool messages are sent verbatim. Older messages are folded into a running summary so the agent keeps durable context without sending the whole session every turn. The default is `10`. Tool output is capped before it is stored and capped more tightly when sent back as model context. If a selected model still reports a context-window error, CodeGollm retries once with a compact recent-history tail.
 
 `approved_tools` stores exact approved operations. Bash approvals are exact command strings. Write and edit approvals include the exact target path and proposed content/change.
 
