@@ -19,7 +19,14 @@ Approval controls:
 
 Slash commands:
 
-- `/model` lists installed Ollama models from `ollama list` when `provider: ollama` is configured.
+- `/auth` shows configured auth profiles and the auth store path.
+- `/login openai-api-key [profile] [env]` uses an OpenAI API key from an environment variable.
+- `/login openai-codex [profile]` logs in with a ChatGPT account and stores a local auth profile.
+- `/logout [profile]` removes an auth profile.
+- `/model` lists available models for the active provider. For OpenAI and ChatGPT auth, it calls `/v1/models`, filters out non-chat models, and puts the preferred model first.
+- `/model auto` saves `model: auto`, so each OpenAI/ChatGPT request uses the first available entry from `preferred_models`.
+- `/reasoning [none|minimal|low|medium|high|xhigh]` shows or saves the OpenAI reasoning level.
+- `/fast [on|off|toggle]` toggles fast model preference for automatic model selection.
 - `/help` lists available commands.
 
 ## Requirements
@@ -43,11 +50,31 @@ Do not store the API key in `config.yaml`. The config stores the environment var
 ```yaml
 provider: openai
 model: gpt-4.1-mini
+auth_profile: openai-api-key:default
+preferred_models:
+  - gpt-5.5
+  - gpt-5.4
+  - gpt-5.4-mini
+  - gpt-5.2-codex
+  - gpt-5.1-codex
+  - gpt-5-codex
+  - gpt-5
+  - gpt-4.1
+  - gpt-4.1-mini
+reasoning_level: medium
+fast: false
 openai_base_url: https://api.openai.com/v1
 openai_api_key_env: OPENAI_API_KEY
 ```
 
 Use `.env.example` as the template. Keep real `.env` files uncommitted.
+
+Alternatively, run `/login openai-codex` inside the TUI to authenticate with a ChatGPT account. CodeGollm opens a browser OAuth flow and stores tokens in `~/.config/codegollm/auth-profiles.json` with file mode `0600`. The workspace `config.yaml` only stores the selected profile id:
+
+```yaml
+provider: openai-codex
+auth_profile: openai-codex:default
+```
 
 For Ollama, change the provider and model:
 
@@ -63,7 +90,16 @@ ollama_url: http://localhost:11434
 go run .
 ```
 
-Edit `config.yaml` to change the model, Ollama URL, or system prompt.
+Edit `config.yaml` to change the model, Ollama URL, or system prompt. Shell flags can override runtime behaviour without saving config:
+
+```bash
+codegollm --reasoning high --fast
+codegollm --reasoning low --no-fast
+```
+
+Set `model: auto` to choose the first available entry from `preferred_models` at request time. With an explicit model name, CodeGollm uses that model until you change it. The `/model` picker also uses `preferred_models` to mark and order the recommended OpenAI/ChatGPT choice.
+
+`reasoning_level` is sent as OpenAI `reasoning_effort` for reasoning-capable Chat Completions models such as GPT-5, o-series, and Codex-family models. It is omitted for non-reasoning models such as GPT-4.1. `none` is omitted for older reasoning models that do not support it, and unsupported `xhigh` requests are downgraded to `high`. `fast: true` biases automatic model selection toward `mini` or `nano` models rather than sending provider-specific latency controls that may not be available on every account.
 
 `recent_history_messages` controls how many recent chat/tool messages are sent verbatim. Older messages are folded into a running summary so the agent keeps durable context without sending the whole session every turn. The default is `10`.
 
