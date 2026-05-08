@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -1093,6 +1094,44 @@ func TestSessionRoundTripAndSystemPromptRefresh(t *testing.T) {
 	}
 }
 
+func TestToolResultsAreTruncatedForStorageAndContext(t *testing.T) {
+	large := strings.Repeat("a", maxToolResultBytes+2048)
+	truncated := truncateToolResult(large)
+	if len(truncated) >= len(large) {
+		t.Fatal("tool result was not truncated")
+	}
+	if !strings.Contains(truncated, "tool output truncated") {
+		t.Fatalf("missing truncation marker: %q", truncated)
+	}
+
+	req := toolRequest{
+		Call: ToolCall{ID: "call_1", Function: ToolFunction{Name: "bash"}},
+		Name: "bash",
+	}
+	m := model{
+		runID:       1,
+		busy:        true,
+		sessionPath: filepath.Join(t.TempDir(), ".codegollm", "session.json"),
+		cfg:         Config{SystemPrompt: "system", RecentHistoryMessages: 10},
+		messages: []ChatMessage{
+			{Role: "system", Content: "system"},
+			{Role: "assistant", ToolCalls: []ToolCall{req.Call}},
+		},
+	}
+	updated, _ := m.Update(toolResultMsg{runID: 1, req: req, result: large})
+	got := updated.(model)
+	if len(got.messages) < 3 || len(got.messages[2].Content) >= len(large) {
+		t.Fatalf("stored tool result was not truncated")
+	}
+
+	context := got.contextMessages()
+	for _, msg := range context {
+		if msg.Role == "tool" && len(msg.Content) >= len(large) {
+			t.Fatal("context contains oversized tool result")
+		}
+	}
+}
+
 func TestRenderLogLineWrapsLongAssistantText(t *testing.T) {
 	m := model{width: 48}
 	rendered := m.renderLogLine(logLine{
@@ -1111,6 +1150,65 @@ func TestRenderLogLineWrapsLongAssistantText(t *testing.T) {
 	}
 	if strings.HasPrefix(lines[1], "assistant: ") {
 		t.Fatalf("continuation line should not repeat label: %q", lines[1])
+	}
+}
+
+func TestPromptHistoryNavigationAndClear(t *testing.T) {
+	input := textinput.New()
+	m := model{input: input}
+	m = m.addPromptHistory("first prompt")
+	m = m.addPromptHistory("second prompt")
+	m.input.SetValue("draft")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if cmd != nil {
+		t.Fatal("history navigation should not return a command")
+	}
+	got := updated.(model)
+	if got.input.Value() != "second prompt" {
+		t.Fatalf("up value = %q", got.input.Value())
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyUp})
+	got = updated.(model)
+	if got.input.Value() != "first prompt" {
+		t.Fatalf("second up value = %q", got.input.Value())
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyDown})
+	got = updated.(model)
+	if got.input.Value() != "second prompt" {
+		t.Fatalf("down value = %q", got.input.Value())
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyDown})
+	got = updated.(model)
+	if got.input.Value() != "draft" {
+		t.Fatalf("down to draft value = %q", got.input.Value())
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	got = updated.(model)
+	if got.input.Value() != "" || got.promptHistoryPos != -1 {
+		t.Fatalf("clear left value=%q pos=%d", got.input.Value(), got.promptHistoryPos)
+	}
+}
+
+func TestSubmittedSlashCommandIsAddedToPromptHistory(t *testing.T) {
+	input := textinput.New()
+	input.SetValue("/help")
+	m := model{input: input, promptHistoryPos: -1}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("help command should not return async command")
+	}
+	got := updated.(model)
+	if len(got.promptHistory) != 1 || got.promptHistory[0] != "/help" {
+		t.Fatalf("history = %#v", got.promptHistory)
+	}
+	if got.input.Value() != "" {
+		t.Fatalf("input value = %q", got.input.Value())
 	}
 }
 
