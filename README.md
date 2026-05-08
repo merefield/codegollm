@@ -21,9 +21,10 @@ Slash commands:
 
 - `/auth` shows configured auth profiles and the auth store path.
 - `/login openai-api-key [profile] [env]` uses an OpenAI API key from an environment variable.
-- `/login openai-codex [profile]` logs in with a ChatGPT account and stores a local auth profile.
+- `/login openai-codex [profile] [workspace_id]` logs in with a ChatGPT account and stores a local auth profile.
 - `/logout [profile]` removes an auth profile.
-- `/model` lists available models for the active provider. For OpenAI and ChatGPT auth, it calls `/v1/models`, filters out non-chat models, and puts the preferred model first.
+- `/model` lists a curated, scrollable set of available models for the active provider. For OpenAI and ChatGPT auth, it calls `/v1/models`, filters out non-chat models, and puts the preferred model first.
+- `/model all` opens the full scrollable model list.
 - `/model auto` saves `model: auto`, so each OpenAI/ChatGPT request uses the first available entry from `preferred_models`.
 - `/reasoning [none|minimal|low|medium|high|xhigh]` shows or saves the OpenAI reasoning level.
 - `/fast [on|off|toggle]` toggles fast model preference for automatic model selection.
@@ -69,12 +70,15 @@ openai_api_key_env: OPENAI_API_KEY
 
 Use `.env.example` as the template. Keep real `.env` files uncommitted.
 
-Alternatively, run `/login openai-codex` inside the TUI to authenticate with a ChatGPT account. CodeGollm opens a browser OAuth flow and stores tokens in `~/.config/codegollm/auth-profiles.json` with file mode `0600`. The workspace `config.yaml` only stores the selected profile id:
+Alternatively, run `/login openai-codex` inside the TUI to authenticate with a ChatGPT account. CodeGollm opens a browser OAuth flow and stores tokens in `~/.config/codegollm/auth-profiles.json` with file mode `0600`. The workspace `config.yaml` only stores the selected profile id and optional workspace id:
 
 ```yaml
 provider: openai-codex
 auth_profile: openai-codex:default
+chatgpt_workspace_id: org-...
 ```
+
+ChatGPT login uses the ChatGPT/Codex Responses backend with the OAuth access token. If the optional generated API-key exchange fails, CodeGollm keeps the ChatGPT profile and uses Responses directly.
 
 For Ollama, change the provider and model:
 

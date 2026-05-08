@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -34,6 +35,7 @@ const (
 	defaultAuthProfile          = "openai-api-key:default"
 	defaultChatGPTAuthProfile   = "openai-codex:default"
 	defaultChatGPTIssuer        = "https://auth.openai.com"
+	defaultChatGPTCodexBaseURL  = "https://chatgpt.com/backend-api/codex"
 	defaultChatGPTOAuthClient   = "app_EMoamEEZ73f0CkXaXp7hrann"
 	defaultChatGPTCallbackPort  = 1455
 	fallbackChatGPTCallbackPort = 1457
@@ -50,7 +52,9 @@ type Config struct {
 	OpenAIBaseURL         string   `yaml:"openai_base_url"`
 	OpenAIAPIKeyEnv       string   `yaml:"openai_api_key_env"`
 	ChatGPTIssuer         string   `yaml:"chatgpt_issuer"`
+	ChatGPTCodexBaseURL   string   `yaml:"chatgpt_codex_base_url"`
 	ChatGPTOAuthClientID  string   `yaml:"chatgpt_oauth_client_id"`
+	ChatGPTWorkspaceID    string   `yaml:"chatgpt_workspace_id"`
 	RecentHistoryMessages int      `yaml:"recent_history_messages"`
 	ApprovedTools         []string `yaml:"approved_tools"`
 	SystemPrompt          string   `yaml:"system_prompt"`
@@ -163,13 +167,78 @@ type OpenAIChatResponse struct {
 	} `json:"error,omitempty"`
 }
 
+type responsesRequest struct {
+	Model             string               `json:"model"`
+	Instructions      string               `json:"instructions,omitempty"`
+	Input             []responsesInputItem `json:"input"`
+	Tools             []responsesTool      `json:"tools,omitempty"`
+	ToolChoice        string               `json:"tool_choice,omitempty"`
+	Reasoning         *responsesReasoning  `json:"reasoning,omitempty"`
+	ParallelToolCalls bool                 `json:"parallel_tool_calls"`
+	Store             bool                 `json:"store"`
+	Stream            bool                 `json:"stream"`
+}
+
+type responsesReasoning struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+type responsesInputItem struct {
+	Type      string                 `json:"type"`
+	Role      string                 `json:"role,omitempty"`
+	Content   []responsesContentPart `json:"content,omitempty"`
+	CallID    string                 `json:"call_id,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Arguments string                 `json:"arguments,omitempty"`
+	Output    string                 `json:"output,omitempty"`
+}
+
+type responsesContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type responsesTool struct {
+	Type        string         `json:"type"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+	Strict      bool           `json:"strict,omitempty"`
+}
+
+type responsesResponse struct {
+	Output []responsesOutputItem `json:"output"`
+	Error  *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error,omitempty"`
+}
+
+type responsesOutputItem struct {
+	Type      string                 `json:"type"`
+	Role      string                 `json:"role,omitempty"`
+	Content   []responsesContentPart `json:"content,omitempty"`
+	CallID    string                 `json:"call_id,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Arguments string                 `json:"arguments,omitempty"`
+}
+
+type responsesStreamEvent struct {
+	Type     string               `json:"type"`
+	Item     *responsesOutputItem `json:"item,omitempty"`
+	Response *responsesResponse   `json:"response,omitempty"`
+	Error    *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error,omitempty"`
+	Delta string `json:"delta,omitempty"`
+}
+
 type OpenAIModelsResponse struct {
 	Data []struct {
 		ID string `json:"id"`
 	} `json:"data"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
+	Error json.RawMessage `json:"error,omitempty"`
 }
 
 type toolRequest struct {
@@ -207,8 +276,12 @@ type model struct {
 	steering         *toolRequest
 	modelChoices     []string
 	modelCursor      int
+	modelScroll      int
 	modelRecommended string
+	modelTotal       int
+	modelAll         bool
 	width            int
+	height           int
 	runID            int
 	cancel           context.CancelFunc
 	activeTool       *toolRequest
@@ -234,6 +307,8 @@ type modelsMsg struct {
 	runID       int
 	models      []string
 	recommended string
+	total       int
+	all         bool
 }
 type authMsg struct {
 	runID int
@@ -340,6 +415,7 @@ func loadConfig() (Config, string, error) {
 		OpenAIBaseURL:         "https://api.openai.com/v1",
 		OpenAIAPIKeyEnv:       "OPENAI_API_KEY",
 		ChatGPTIssuer:         defaultChatGPTIssuer,
+		ChatGPTCodexBaseURL:   defaultChatGPTCodexBaseURL,
 		ChatGPTOAuthClientID:  defaultChatGPTOAuthClient,
 		RecentHistoryMessages: 10,
 		SystemPrompt:          "You are codegollm, a minimal local coding agent with read, write, edit, and bash tools.",
@@ -388,6 +464,9 @@ func loadConfig() (Config, string, error) {
 	}
 	if cfg.ChatGPTIssuer == "" {
 		cfg.ChatGPTIssuer = defaultChatGPTIssuer
+	}
+	if cfg.ChatGPTCodexBaseURL == "" {
+		cfg.ChatGPTCodexBaseURL = defaultChatGPTCodexBaseURL
 	}
 	if cfg.ChatGPTOAuthClientID == "" {
 		cfg.ChatGPTOAuthClientID = defaultChatGPTOAuthClient
@@ -732,6 +811,63 @@ func jwtStringClaim(jwt, name string) string {
 	return ""
 }
 
+func chatGPTOrganizations(idToken string) []chatGPTOrganization {
+	claims, err := decodeJWTPayload(idToken)
+	if err != nil {
+		return nil
+	}
+	auth, ok := claims["https://api.openai.com/auth"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawOrgs, ok := auth["organizations"].([]any)
+	if !ok {
+		return nil
+	}
+	var orgs []chatGPTOrganization
+	for _, raw := range rawOrgs {
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		org := chatGPTOrganization{}
+		if id, ok := obj["id"].(string); ok {
+			org.ID = id
+		}
+		if title, ok := obj["title"].(string); ok {
+			org.Title = title
+		} else if name, ok := obj["name"].(string); ok {
+			org.Title = name
+		}
+		if isDefault, ok := obj["is_default"].(bool); ok {
+			org.IsDefault = isDefault
+		}
+		if org.ID != "" {
+			orgs = append(orgs, org)
+		}
+	}
+	return orgs
+}
+
+func chatGPTWorkspaceHint(profileID, idToken string) string {
+	orgs := chatGPTOrganizations(idToken)
+	if len(orgs) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, org := range orgs {
+		label := org.ID
+		if org.Title != "" {
+			label += " (" + org.Title + ")"
+		}
+		if org.IsDefault {
+			label += " default"
+		}
+		parts = append(parts, "/login openai-codex "+profileID+" "+org.ID+" for "+label)
+	}
+	return " Choose a workspace and rerun " + strings.Join(parts, " or ") + "."
+}
+
 func jwtExpiration(jwt string) time.Time {
 	claims, err := decodeJWTPayload(jwt)
 	if err != nil {
@@ -777,6 +913,12 @@ type oauthLogin struct {
 	PKCE        pkceCodes
 	State       string
 	AuthURL     string
+}
+
+type chatGPTOrganization struct {
+	ID        string
+	Title     string
+	IsDefault bool
 }
 
 func refreshOAuthProfileIfNeeded(ctx context.Context, cfg Config, profile AuthProfile) (AuthProfile, bool, error) {
@@ -948,12 +1090,18 @@ func chatGPTAuthorizeURL(cfg Config, redirectURI, state string, pkce pkceCodes) 
 	values.Set("codex_cli_simplified_flow", "true")
 	values.Set("state", state)
 	values.Set("originator", "codegollm")
+	if workspaceID := strings.TrimSpace(cfg.ChatGPTWorkspaceID); workspaceID != "" {
+		values.Set("allowed_workspace_id", workspaceID)
+	}
 	return strings.TrimRight(cfg.ChatGPTIssuer, "/") + "/oauth/authorize?" + values.Encode()
 }
 
-func newChatGPTLogin(cfg Config, profileID string) (oauthLogin, error) {
+func newChatGPTLogin(cfg Config, profileID, workspaceID string) (oauthLogin, error) {
 	if strings.TrimSpace(profileID) == "" {
 		profileID = defaultChatGPTAuthProfile
+	}
+	if strings.TrimSpace(workspaceID) != "" {
+		cfg.ChatGPTWorkspaceID = strings.TrimSpace(workspaceID)
 	}
 	listener, redirectURI, err := listenOAuthCallback()
 	if err != nil {
@@ -982,7 +1130,7 @@ func newChatGPTLogin(cfg Config, profileID string) (oauthLogin, error) {
 }
 
 func runChatGPTLogin(ctx context.Context, cfg Config, profileID string) (string, error) {
-	login, err := newChatGPTLogin(cfg, profileID)
+	login, err := newChatGPTLogin(cfg, profileID, "")
 	if err != nil {
 		return "", err
 	}
@@ -1060,8 +1208,11 @@ func completeChatGPTLogin(ctx context.Context, cfg Config, login oauthLogin) (st
 		return "", err
 	}
 	profile := profileFromOAuthTokens(AuthProfile{}, tokens)
+	var apiKeyErr error
 	if apiKey, err := obtainChatGPTAPIKey(ctx, cfg, profile.IDToken); err == nil && apiKey != "" {
 		profile.APIKey = apiKey
+	} else if err != nil {
+		apiKeyErr = err
 	}
 	store, err := loadAuthProfiles()
 	if err != nil {
@@ -1071,7 +1222,14 @@ func completeChatGPTLogin(ctx context.Context, cfg Config, login oauthLogin) (st
 	if err := saveAuthProfiles(store); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("logged in ChatGPT profile %s using account %s", login.ProfileID, emptyDash(profile.AccountID)), nil
+	msg := fmt.Sprintf("logged in ChatGPT profile %s using account %s", login.ProfileID, emptyDash(profile.AccountID))
+	if profile.APIKey == "" {
+		msg += "; generated API key unavailable, using ChatGPT Responses backend"
+		if apiKeyErr != nil {
+			msg += ": " + apiKeyErr.Error()
+		}
+	}
+	return msg, nil
 }
 
 func listenOAuthCallback() (net.Listener, string, error) {
@@ -1285,6 +1443,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 	case tea.KeyMsg:
 		if m.steering != nil {
 			switch msg.String() {
@@ -1336,12 +1495,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.modelCursor < len(m.modelChoices)-1 {
 					m.modelCursor++
 				}
+			case "pgup":
+				m.modelCursor -= m.modelPageSize()
+				if m.modelCursor < 0 {
+					m.modelCursor = 0
+				}
+			case "pgdown":
+				m.modelCursor += m.modelPageSize()
+				if m.modelCursor >= len(m.modelChoices) {
+					m.modelCursor = len(m.modelChoices) - 1
+				}
+			case "home":
+				m.modelCursor = 0
+			case "end":
+				m.modelCursor = len(m.modelChoices) - 1
 			case "enter":
 				selected := m.modelChoices[m.modelCursor]
 				m.cfg.Model = selected
 				m.modelChoices = nil
 				m.modelCursor = 0
+				m.modelScroll = 0
 				m.modelRecommended = ""
+				m.modelTotal = 0
+				m.modelAll = false
 				if err := saveConfig(m.configPath, m.cfg); err != nil {
 					m.logs = append(m.logs, logLine{Kind: "error", Text: "model switched to " + selected + " but config save failed: " + err.Error()})
 				} else {
@@ -1350,8 +1526,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc", "ctrl+c":
 				m.modelChoices = nil
 				m.modelCursor = 0
+				m.modelScroll = 0
 				m.modelRecommended = ""
+				m.modelTotal = 0
+				m.modelAll = false
 			}
+			m = m.ensureModelCursorVisible()
 			return m, nil
 		}
 		if m.pending != nil {
@@ -1488,13 +1668,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.modelChoices = msg.models
 		m.modelRecommended = msg.recommended
+		m.modelTotal = msg.total
+		m.modelAll = msg.all
 		m.modelCursor = 0
+		m.modelScroll = 0
 		for i, name := range msg.models {
 			if name == m.cfg.Model {
 				m.modelCursor = i
 				break
 			}
 		}
+		m = m.ensureModelCursorVisible()
 	case authMsg:
 		var ok bool
 		m, ok = m.finishRun(msg.runID)
@@ -1528,9 +1712,13 @@ func (m model) View() string {
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("root: %s | provider: %s | model: %s | saved approvals: %d\n\n", m.root, m.cfg.Provider, m.cfg.Model, len(m.cfg.ApprovedTools)))
 
+	maxLogs := 18
+	if len(m.modelChoices) > 0 {
+		maxLogs = 6
+	}
 	start := 0
-	if len(m.logs) > 18 {
-		start = len(m.logs) - 18
+	if len(m.logs) > maxLogs {
+		start = len(m.logs) - maxLogs
 	}
 	for _, l := range m.logs[start:] {
 		b.WriteString(m.renderLogLine(l))
@@ -1551,8 +1739,19 @@ func (m model) View() string {
 		b.WriteString("\n\n")
 	} else if len(m.modelChoices) > 0 {
 		var list strings.Builder
-		list.WriteString("Select model\n\n")
-		for i, name := range m.modelChoices {
+		start, end := m.modelVisibleRange()
+		shown := end - start
+		mode := "curated"
+		if m.modelAll {
+			mode = "all"
+		}
+		total := m.modelTotal
+		if total <= 0 {
+			total = len(m.modelChoices)
+		}
+		list.WriteString(fmt.Sprintf("Select model (%s, showing %d of %d, %d-%d)\n\n", mode, shown, total, start+1, end))
+		for i := start; i < end; i++ {
+			name := m.modelChoices[i]
 			cursor := "  "
 			if i == m.modelCursor {
 				cursor = "> "
@@ -1566,7 +1765,10 @@ func (m model) View() string {
 			}
 			list.WriteString("\n")
 		}
-		list.WriteString("\n[up/down] move  [enter] select  [esc] cancel")
+		list.WriteString("\n[up/down] move  [pgup/pgdn] page  [home/end] jump  [enter] select  [esc] cancel")
+		if !m.modelAll && total > len(m.modelChoices) {
+			list.WriteString("\nUse /model all to browse every available model.")
+		}
 		b.WriteString(boxStyle.Render(list.String()))
 		b.WriteString("\n\n")
 	} else if m.busy {
@@ -1625,6 +1827,62 @@ func (m model) renderLogLine(line logLine) string {
 		}
 	}
 	return b.String()
+}
+
+func (m model) modelPageSize() int {
+	size := 10
+	if m.height > 0 {
+		size = m.height - 14
+	}
+	if size < 5 {
+		return 5
+	}
+	if size > 12 {
+		return 12
+	}
+	return size
+}
+
+func (m model) ensureModelCursorVisible() model {
+	if len(m.modelChoices) == 0 {
+		m.modelCursor = 0
+		m.modelScroll = 0
+		return m
+	}
+	if m.modelCursor < 0 {
+		m.modelCursor = 0
+	}
+	if m.modelCursor >= len(m.modelChoices) {
+		m.modelCursor = len(m.modelChoices) - 1
+	}
+	pageSize := m.modelPageSize()
+	if m.modelCursor < m.modelScroll {
+		m.modelScroll = m.modelCursor
+	}
+	if m.modelCursor >= m.modelScroll+pageSize {
+		m.modelScroll = m.modelCursor - pageSize + 1
+	}
+	if m.modelScroll < 0 {
+		m.modelScroll = 0
+	}
+	maxScroll := len(m.modelChoices) - pageSize
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.modelScroll > maxScroll {
+		m.modelScroll = maxScroll
+	}
+	return m
+}
+
+func (m model) modelVisibleRange() (int, int) {
+	m = m.ensureModelCursorVisible()
+	start := m.modelScroll
+	end := start + m.modelPageSize()
+	if end > len(m.modelChoices) {
+		end = len(m.modelChoices)
+	}
+	return start, end
 }
 
 func wrapText(text string, width int) string {
@@ -1785,7 +2043,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/login":
 		if len(fields) < 2 {
-			m.logs = append(m.logs, logLine{Kind: "system", Text: "usage: /login openai-codex [profile] or /login openai-api-key [profile] [env]"})
+			m.logs = append(m.logs, logLine{Kind: "system", Text: "usage: /login openai-codex [profile] [workspace_id] or /login openai-api-key [profile] [env]"})
 			return m, nil
 		}
 		kind := strings.ToLower(fields[1])
@@ -1817,13 +2075,20 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 			if len(fields) >= 3 {
 				profileID = fields[2]
 			}
-			login, err := newChatGPTLogin(m.cfg, profileID)
+			workspaceID := ""
+			if len(fields) >= 4 {
+				workspaceID = fields[3]
+			}
+			login, err := newChatGPTLogin(m.cfg, profileID, workspaceID)
 			if err != nil {
 				m.logs = append(m.logs, logLine{Kind: "error", Text: err.Error()})
 				return m, nil
 			}
 			m.cfg.Provider = "openai-codex"
 			m.cfg.AuthProfile = login.ProfileID
+			if workspaceID != "" {
+				m.cfg.ChatGPTWorkspaceID = workspaceID
+			}
 			if err := saveConfig(m.configPath, m.cfg); err != nil {
 				_ = login.Listener.Close()
 				m.logs = append(m.logs, logLine{Kind: "error", Text: "could not save config: " + err.Error()})
@@ -1869,9 +2134,18 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		m.logs = append(m.logs, logLine{Kind: "system", Text: "loading models for " + providerName(m.cfg) + "..."})
+		allModels := len(fields) >= 2 && strings.EqualFold(fields[1], "all")
+		if len(fields) >= 2 && !allModels {
+			m.logs = append(m.logs, logLine{Kind: "system", Text: "usage: /model, /model all, or /model auto"})
+			return m, nil
+		}
+		if allModels {
+			m.logs = append(m.logs, logLine{Kind: "system", Text: "loading all models for " + providerName(m.cfg) + "..."})
+		} else {
+			m.logs = append(m.logs, logLine{Kind: "system", Text: "loading curated models for " + providerName(m.cfg) + "..."})
+		}
 		m, runID, ctx := m.beginRun(nil)
-		return m, listModelsCmd(ctx, m.cfg, runID)
+		return m, listModelsCmd(ctx, m.cfg, runID, allModels)
 	case "/reasoning":
 		if len(fields) < 2 {
 			m.logs = append(m.logs, logLine{Kind: "system", Text: "reasoning: " + m.cfg.ReasoningLevel + " | usage: /reasoning none|minimal|low|medium|high|xhigh"})
@@ -1910,7 +2184,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "/help":
-		m.logs = append(m.logs, logLine{Kind: "system", Text: "commands: /auth, /login openai-codex [profile], /login openai-api-key [profile] [env], /logout [profile], /model, /model auto, /reasoning [none|minimal|low|medium|high|xhigh], /fast [on|off|toggle], /help"})
+		m.logs = append(m.logs, logLine{Kind: "system", Text: "commands: /auth, /login openai-codex [profile] [workspace_id], /login openai-api-key [profile] [env], /logout [profile], /model, /model all, /model auto, /reasoning [none|minimal|low|medium|high|xhigh], /fast [on|off|toggle], /help"})
 		return m, nil
 	default:
 		m.logs = append(m.logs, logLine{Kind: "error", Text: "unknown command: " + cmd})
@@ -2378,7 +2652,7 @@ func callModel(ctx context.Context, cfg Config, messages []ChatMessage, tools []
 	case "", "openai":
 		return callOpenAI(ctx, cfg, messages, tools)
 	case "openai-codex":
-		return callOpenAI(ctx, cfg, messages, tools)
+		return callChatGPTCodexResponses(ctx, cfg, messages, tools)
 	case "ollama":
 		return callOllama(ctx, cfg, messages, tools)
 	default:
@@ -2392,7 +2666,7 @@ func callOpenAI(ctx context.Context, cfg Config, messages []ChatMessage, tools [
 		return ChatMessage{}, err
 	}
 	if auth.Provider == "openai-codex" && auth.APIKey == "" {
-		return ChatMessage{}, errors.New("ChatGPT OAuth profile has no generated API key for chat completions; re-run /login openai-codex")
+		return ChatMessage{}, errors.New("ChatGPT OAuth profiles use the Responses backend; call the openai-codex provider through callModel")
 	}
 	modelName := strings.TrimSpace(cfg.Model)
 	if modelName == "" || strings.EqualFold(modelName, "auto") {
@@ -2459,6 +2733,265 @@ func callOpenAI(ctx context.Context, cfg Config, messages []ChatMessage, tools [
 		}
 	}
 	return msg, nil
+}
+
+func callChatGPTCodexResponses(ctx context.Context, cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
+	auth, err := resolveAuth(ctx, cfg)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if auth.BearerToken == "" {
+		return callOpenAI(ctx, cfg, messages, tools)
+	}
+	modelName := strings.TrimSpace(cfg.Model)
+	if modelName == "" || strings.EqualFold(modelName, "auto") {
+		modelName = "gpt-5"
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	request := responsesRequest{
+		Model:             modelName,
+		Instructions:      responsesInstructions(messages),
+		Input:             responsesInput(messages),
+		Tools:             responsesTools(tools),
+		ToolChoice:        "auto",
+		ParallelToolCalls: false,
+		Store:             false,
+		Stream:            true,
+	}
+	if effort := reasoningEffortForRequest(cfg, modelName); effort != "" {
+		request.Reasoning = &responsesReasoning{Effort: effort}
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.ChatGPTCodexBaseURL, "/")+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
+	if auth.AccountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", auth.AccountID)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if resp.StatusCode >= 300 {
+		var out responsesResponse
+		_ = json.Unmarshal(data, &out)
+		if out.Error != nil && out.Error.Message != "" {
+			return ChatMessage{}, fmt.Errorf("chatgpt responses status %d: %s", resp.StatusCode, out.Error.Message)
+		}
+		return ChatMessage{}, fmt.Errorf("chatgpt responses status %d: %s", resp.StatusCode, string(data))
+	}
+	out, err := parseResponsesStream(data)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if out.Error != nil && out.Error.Message != "" {
+		return ChatMessage{}, errors.New(out.Error.Message)
+	}
+	msg := chatMessageFromResponses(out)
+	if msg.Content == "" && len(msg.ToolCalls) == 0 {
+		return ChatMessage{}, errors.New("chatgpt responses returned no output")
+	}
+	return msg, nil
+}
+
+func responsesInstructions(messages []ChatMessage) string {
+	var parts []string
+	for _, msg := range messages {
+		if msg.Role == "system" && strings.TrimSpace(msg.Content) != "" {
+			parts = append(parts, msg.Content)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func responsesInput(messages []ChatMessage) []responsesInputItem {
+	messages, _ = repairUnansweredToolCalls(messages)
+	out := make([]responsesInputItem, 0, len(messages))
+	pendingToolCalls := map[string]bool{}
+	for _, msg := range messages {
+		switch msg.Role {
+		case "system":
+			continue
+		case "tool":
+			if msg.ToolCallID == "" || !pendingToolCalls[msg.ToolCallID] {
+				out = append(out, responsesMessageItem("user", "Prior tool result from "+msg.ToolName+": "+msg.Content))
+				continue
+			}
+			delete(pendingToolCalls, msg.ToolCallID)
+			out = append(out, responsesInputItem{Type: "function_call_output", CallID: msg.ToolCallID, Output: msg.Content})
+		case "assistant":
+			if strings.TrimSpace(msg.Content) != "" {
+				out = append(out, responsesMessageItem("assistant", msg.Content))
+			}
+			for _, call := range msg.ToolCalls {
+				if strings.TrimSpace(call.ID) == "" {
+					continue
+				}
+				args := strings.TrimSpace(string(call.Function.Arguments))
+				if args == "" {
+					args = "{}"
+				}
+				out = append(out, responsesInputItem{
+					Type:      "function_call",
+					CallID:    call.ID,
+					Name:      call.Function.Name,
+					Arguments: args,
+				})
+				pendingToolCalls[call.ID] = true
+			}
+		default:
+			out = append(out, responsesMessageItem(msg.Role, msg.Content))
+			pendingToolCalls = map[string]bool{}
+		}
+	}
+	return out
+}
+
+func responsesMessageItem(role, text string) responsesInputItem {
+	contentType := "input_text"
+	if role == "assistant" {
+		contentType = "output_text"
+	}
+	return responsesInputItem{
+		Type: "message",
+		Role: role,
+		Content: []responsesContentPart{{
+			Type: contentType,
+			Text: text,
+		}},
+	}
+}
+
+func responsesTools(tools []ToolSchema) []responsesTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]responsesTool, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, responsesTool{
+			Type:        "function",
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  tool.Function.Parameters,
+			Strict:      true,
+		})
+	}
+	return out
+}
+
+func parseResponsesStream(data []byte) (responsesResponse, error) {
+	var out responsesResponse
+	var textDeltas []string
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	var eventLines []string
+	flush := func() error {
+		if len(eventLines) == 0 {
+			return nil
+		}
+		raw := strings.Join(eventLines, "\n")
+		eventLines = nil
+		if strings.TrimSpace(raw) == "[DONE]" {
+			return nil
+		}
+		var event responsesStreamEvent
+		if err := json.Unmarshal([]byte(raw), &event); err != nil {
+			return err
+		}
+		if event.Error != nil {
+			out.Error = event.Error
+			return nil
+		}
+		switch event.Type {
+		case "response.output_item.done":
+			if event.Item != nil {
+				out.Output = append(out.Output, *event.Item)
+			}
+		case "response.completed":
+			if event.Response != nil && len(event.Response.Output) > 0 {
+				out.Output = event.Response.Output
+			}
+			if event.Response != nil && event.Response.Error != nil {
+				out.Error = event.Response.Error
+			}
+		case "response.output_text.delta":
+			if event.Delta != "" {
+				textDeltas = append(textDeltas, event.Delta)
+			}
+		}
+		return nil
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := flush(); err != nil {
+				return out, err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			eventLines = append(eventLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return out, err
+	}
+	if err := flush(); err != nil {
+		return out, err
+	}
+	if len(out.Output) == 0 && len(textDeltas) > 0 {
+		out.Output = append(out.Output, responsesOutputItem{
+			Type: "message",
+			Role: "assistant",
+			Content: []responsesContentPart{{
+				Type: "output_text",
+				Text: strings.Join(textDeltas, ""),
+			}},
+		})
+	}
+	return out, nil
+}
+
+func chatMessageFromResponses(out responsesResponse) ChatMessage {
+	msg := ChatMessage{Role: "assistant"}
+	var textParts []string
+	for _, item := range out.Output {
+		switch item.Type {
+		case "message":
+			for _, part := range item.Content {
+				if part.Text != "" {
+					textParts = append(textParts, part.Text)
+				}
+			}
+		case "function_call":
+			args := strings.TrimSpace(item.Arguments)
+			if args == "" {
+				args = "{}"
+			}
+			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+				ID:   item.CallID,
+				Type: "function",
+				Function: ToolFunction{
+					Name:      item.Name,
+					Arguments: json.RawMessage(args),
+				},
+			})
+		}
+	}
+	msg.Content = strings.Join(textParts, "\n")
+	return msg
 }
 
 func reasoningEffortForRequest(cfg Config, modelName string) string {
@@ -2629,13 +3162,13 @@ func callOllama(ctx context.Context, cfg Config, messages []ChatMessage, tools [
 	return out.Message, nil
 }
 
-func listModelsCmd(ctx context.Context, cfg Config, runID int) tea.Cmd {
+func listModelsCmd(ctx context.Context, cfg Config, runID int, all bool) tea.Cmd {
 	return func() tea.Msg {
-		models, recommended, err := listProviderModels(ctx, cfg)
+		models, recommended, total, err := listProviderModels(ctx, cfg, all)
 		if err != nil {
 			return errMsg{runID: runID, err: err}
 		}
-		return modelsMsg{runID: runID, models: models, recommended: recommended}
+		return modelsMsg{runID: runID, models: models, recommended: recommended, total: total, all: all}
 	}
 }
 
@@ -2646,7 +3179,7 @@ func chatGPTLoginCmd(ctx context.Context, cfg Config, login oauthLogin, runID in
 	}
 }
 
-func listProviderModels(ctx context.Context, cfg Config) ([]string, string, error) {
+func listProviderModels(ctx context.Context, cfg Config, all bool) ([]string, string, int, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case "ollama":
 		models, err := listModelsFromCLI(ctx)
@@ -2654,19 +3187,49 @@ func listProviderModels(ctx context.Context, cfg Config) ([]string, string, erro
 			models, err = listModelsFromAPI(ctx, cfg)
 		}
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 		sort.Strings(models)
-		return models, firstModel(models), nil
-	case "", "openai", "openai-codex":
+		total := len(models)
+		if !all {
+			models = curateModelChoices(cfg, models, firstModel(models), 15)
+		}
+		return models, firstModel(models), total, nil
+	case "openai-codex":
+		models := codexModels()
+		recommended := recommendedModel(cfg, models)
+		ordered := orderOpenAIModels(cfg, models, recommended)
+		total := len(ordered)
+		if !all {
+			ordered = curateModelChoices(cfg, ordered, recommended, 15)
+		}
+		return ordered, recommended, total, nil
+	case "", "openai":
 		models, err := listOpenAIModels(ctx, cfg)
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 		recommended := recommendedModel(cfg, models)
-		return orderOpenAIModels(cfg, models, recommended), recommended, nil
+		ordered := orderOpenAIModels(cfg, models, recommended)
+		total := len(ordered)
+		if !all {
+			ordered = curateModelChoices(cfg, ordered, recommended, 15)
+		}
+		return ordered, recommended, total, nil
 	default:
-		return nil, "", errors.New("unknown provider: " + cfg.Provider)
+		return nil, "", 0, errors.New("unknown provider: " + cfg.Provider)
+	}
+}
+
+func codexModels() []string {
+	return []string{
+		"gpt-5.5",
+		"gpt-5.4",
+		"gpt-5.4-mini",
+		"gpt-5.3-codex",
+		"gpt-5.3-codex-spark",
+		"gpt-5.2",
+		"gpt-5",
 	}
 }
 
@@ -2753,15 +3316,15 @@ func listOpenAIModels(ctx context.Context, cfg Config) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode >= 300 {
+		if msg := openAIErrorMessage(data); msg != "" {
+			return nil, fmt.Errorf("openai models status %d: %s", resp.StatusCode, msg)
+		}
+		return nil, fmt.Errorf("openai models status %d: %s", resp.StatusCode, string(data))
+	}
 	var out OpenAIModelsResponse
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, err
-	}
-	if resp.StatusCode >= 300 {
-		if out.Error != nil && out.Error.Message != "" {
-			return nil, fmt.Errorf("openai models status %d: %s", resp.StatusCode, out.Error.Message)
-		}
-		return nil, fmt.Errorf("openai models status %d: %s", resp.StatusCode, string(data))
 	}
 	seen := map[string]bool{}
 	var models []string
@@ -2777,6 +3340,26 @@ func listOpenAIModels(ctx context.Context, cfg Config) ([]string, error) {
 		return nil, errors.New("OpenAI returned no suitable chat models")
 	}
 	return models, nil
+}
+
+func openAIErrorMessage(data []byte) string {
+	var raw struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil || len(raw.Error) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw.Error, &text); err == nil {
+		return text
+	}
+	var obj struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw.Error, &obj); err == nil {
+		return obj.Message
+	}
+	return ""
 }
 
 func orderOpenAIModels(cfg Config, models []string, recommended string) []string {
@@ -2805,6 +3388,34 @@ func orderOpenAIModels(cfg Config, models []string, recommended string) []string
 		add(model)
 	}
 	return ordered
+}
+
+func curateModelChoices(cfg Config, models []string, recommended string, limit int) []string {
+	if limit <= 0 || len(models) <= limit {
+		return append([]string(nil), models...)
+	}
+	available := map[string]bool{}
+	for _, model := range models {
+		available[model] = true
+	}
+	seen := map[string]bool{}
+	var curated []string
+	add := func(model string) {
+		if model == "" || seen[model] || !available[model] || len(curated) >= limit {
+			return
+		}
+		seen[model] = true
+		curated = append(curated, model)
+	}
+	add(cfg.Model)
+	add(recommended)
+	for _, model := range cfg.PreferredModels {
+		add(model)
+	}
+	for _, model := range models {
+		add(model)
+	}
+	return curated
 }
 
 func recommendedModel(cfg Config, models []string) string {
