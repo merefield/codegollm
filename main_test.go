@@ -138,6 +138,9 @@ func TestLoadConfigDefaultsAndLegacyOllamaInference(t *testing.T) {
 		if cfg.ReasoningLevel != "medium" || cfg.Fast {
 			t.Fatalf("unexpected reasoning/fast defaults: %+v", cfg)
 		}
+		if cfg.IncludeReasoningInContext {
+			t.Fatalf("include reasoning default = true, want false")
+		}
 	})
 
 	t.Run("legacy ollama model", func(t *testing.T) {
@@ -296,10 +299,10 @@ func TestChatGPTOrganizationsAndWorkspaceHint(t *testing.T) {
 	if len(orgs) != 2 || orgs[0].ID != "org-one" || !orgs[0].IsDefault || orgs[1].Title != "Two" {
 		t.Fatalf("organizations = %#v", orgs)
 	}
-	hint := chatGPTWorkspaceHint("openai-codex:default", idToken)
+	hint := chatGPTWorkspaceHint("openai-chatgpt:default", idToken)
 	for _, want := range []string{
-		"/login openai-codex openai-codex:default org-one",
-		"/login openai-codex openai-codex:default org-two",
+		"/login openai-chatgpt openai-chatgpt:default org-one",
+		"/login openai-chatgpt openai-chatgpt:default org-two",
 	} {
 		if !strings.Contains(hint, want) {
 			t.Fatalf("hint missing %q: %s", want, hint)
@@ -436,7 +439,7 @@ func TestModelPickerScrollsCursorIntoView(t *testing.T) {
 func TestListOpenAIModelsUsesAuthAndFilters(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := saveAuthProfiles(AuthProfiles{Profiles: map[string]AuthProfile{
-		"test": {Provider: "openai", AuthType: "api_key", APIKey: "sk-test"},
+		"test": {Provider: "openai-compat", AuthType: "api_key", APIKey: "sk-test"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +460,7 @@ func TestListOpenAIModelsUsesAuthAndFilters(t *testing.T) {
 	})}
 
 	models, err := listOpenAIModels(context.Background(), Config{
-		Provider:      "openai",
+		Provider:      "openai-compat",
 		AuthProfile:   "test",
 		OpenAIBaseURL: "https://example.test",
 	})
@@ -473,7 +476,7 @@ func TestListProviderModelsUsesLocalCodexModelsForChatGPTOAuth(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := saveAuthProfiles(AuthProfiles{Profiles: map[string]AuthProfile{
 		"chatgpt": {
-			Provider:    "openai-codex",
+			Provider:    "openai-chatgpt",
 			AuthType:    "oauth",
 			AccessToken: "oauth-access-token",
 			ExpiresAt:   time.Now().Add(time.Hour),
@@ -484,12 +487,12 @@ func TestListProviderModelsUsesLocalCodexModelsForChatGPTOAuth(t *testing.T) {
 	oldClient := http.DefaultClient
 	t.Cleanup(func() { http.DefaultClient = oldClient })
 	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		t.Fatalf("openai-codex model list should not make HTTP request to %s", r.URL.String())
+		t.Fatalf("openai-chatgpt model list should not make HTTP request to %s", r.URL.String())
 		return nil, nil
 	})}
 
 	models, recommended, total, err := listProviderModels(context.Background(), Config{
-		Provider:        "openai-codex",
+		Provider:        "openai-chatgpt",
 		AuthProfile:     "chatgpt",
 		Model:           "gpt-5.4-mini",
 		PreferredModels: defaultPreferredModels(),
@@ -523,10 +526,75 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func TestCallOpenAIRequestBodyIncludesCompatibleReasoning(t *testing.T) {
+func TestCallModelUsesOpenAIResponsesForAPIKeyProvider(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := saveAuthProfiles(AuthProfiles{Profiles: map[string]AuthProfile{
 		"test": {Provider: "openai", AuthType: "api_key", APIKey: "sk-test"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	oldClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = oldClient })
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != "https://example.test/responses" {
+			t.Fatalf("url = %q, want responses", r.URL.String())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		var raw map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if raw["model"] != "gpt-5.4" || raw["stream"] != true {
+			t.Fatalf("unexpected responses request: %#v", raw)
+		}
+		if _, ok := raw["messages"]; ok {
+			t.Fatalf("responses request should not use chat completions messages: %#v", raw)
+		}
+		reasoning, ok := raw["reasoning"].(map[string]any)
+		if !ok || reasoning["effort"] != "high" {
+			t.Fatalf("reasoning = %#v", raw["reasoning"])
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+				`data: {"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"checked context"}]}}`,
+				``,
+				`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+				``,
+				`data: {"type":"response.completed","response":{}}`,
+				``,
+			}, "\n"))),
+		}, nil
+	})}
+
+	msg, err := callModel(context.Background(), Config{
+		Provider:       "openai",
+		AuthProfile:    "test",
+		OpenAIBaseURL:  "https://example.test",
+		Model:          "gpt-5.4",
+		ReasoningLevel: "high",
+	}, []ChatMessage{
+		{Role: "system", Content: "system"},
+		{Role: "user", Content: "hello"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Content != "done" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if reasoning := reasoningTextFromMessage(msg); reasoning != "checked context" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+}
+
+func TestCallOpenAIRequestBodyIncludesCompatibleReasoning(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := saveAuthProfiles(AuthProfiles{Profiles: map[string]AuthProfile{
+		"test": {Provider: "openai-compat", AuthType: "api_key", APIKey: "sk-test"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -558,12 +626,12 @@ func TestCallOpenAIRequestBodyIncludesCompatibleReasoning(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","reasoning_summary":"reviewed request","content":"done"}}]}`)),
 		}, nil
 	})}
 
 	msg, err := callOpenAI(context.Background(), Config{
-		Provider:       "openai",
+		Provider:       "openai-compat",
 		AuthProfile:    "test",
 		OpenAIBaseURL:  "https://example.test",
 		Model:          "gpt-5.4",
@@ -585,12 +653,15 @@ func TestCallOpenAIRequestBodyIncludesCompatibleReasoning(t *testing.T) {
 	if msg.Content != "done" {
 		t.Fatalf("content = %q", msg.Content)
 	}
+	if reasoning := reasoningTextFromMessage(msg); reasoning != "reviewed request" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
 }
 
 func TestCallOpenAIOmitsReasoningForNonReasoningModel(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := saveAuthProfiles(AuthProfiles{Profiles: map[string]AuthProfile{
-		"test": {Provider: "openai", AuthType: "api_key", APIKey: "sk-test"},
+		"test": {Provider: "openai-compat", AuthType: "api_key", APIKey: "sk-test"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +683,7 @@ func TestCallOpenAIOmitsReasoningForNonReasoningModel(t *testing.T) {
 	})}
 
 	_, err := callOpenAI(context.Background(), Config{
-		Provider:       "openai",
+		Provider:       "openai-compat",
 		AuthProfile:    "test",
 		OpenAIBaseURL:  "https://example.test",
 		Model:          "gpt-4.1-mini",
@@ -623,11 +694,89 @@ func TestCallOpenAIOmitsReasoningForNonReasoningModel(t *testing.T) {
 	}
 }
 
+func TestCallOllamaIncludesThinkingForReasoningLevel(t *testing.T) {
+	oldClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = oldClient })
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != "https://ollama.test/api/chat" {
+			t.Fatalf("url = %q, want ollama chat", r.URL.String())
+		}
+		var raw map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if raw["think"] != true {
+			t.Fatalf("think = %#v, want true in %#v", raw["think"], raw)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"message":{"role":"assistant","thinking":"checked files","content":"done"},"done":true}`)),
+		}, nil
+	})}
+
+	msg, err := callOllama(context.Background(), Config{
+		Provider:       "ollama",
+		OllamaURL:      "https://ollama.test",
+		Model:          "qwen3:latest",
+		ReasoningLevel: "medium",
+	}, []ChatMessage{{Role: "user", Content: "hello"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Content != "done" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if reasoning := reasoningTextFromMessage(msg); reasoning != "checked files" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+}
+
+func TestCallOllamaOmitsThinkingForNoneOrBlankReasoningLevel(t *testing.T) {
+	tests := []struct {
+		name  string
+		level string
+	}{
+		{name: "none", level: "none"},
+		{name: "blank", level: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldClient := http.DefaultClient
+			t.Cleanup(func() { http.DefaultClient = oldClient })
+			http.DefaultClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				var raw map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := raw["think"]; ok {
+					t.Fatalf("think should be omitted: %#v", raw)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"message":{"role":"assistant","content":"done"},"done":true}`)),
+				}, nil
+			})}
+
+			_, err := callOllama(context.Background(), Config{
+				Provider:       "ollama",
+				OllamaURL:      "https://ollama.test",
+				Model:          "qwen3:latest",
+				ReasoningLevel: tt.level,
+			}, []ChatMessage{{Role: "user", Content: "hello"}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestCallOpenAIRejectsOAuthBearerWithoutGeneratedAPIKey(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := saveAuthProfiles(AuthProfiles{Profiles: map[string]AuthProfile{
 		"chatgpt": {
-			Provider:    "openai-codex",
+			Provider:    "openai-chatgpt",
 			AuthType:    "oauth",
 			AccessToken: "oauth-access-token",
 			AccountID:   "account-123",
@@ -638,7 +787,7 @@ func TestCallOpenAIRejectsOAuthBearerWithoutGeneratedAPIKey(t *testing.T) {
 	}
 
 	_, err := callOpenAI(context.Background(), Config{
-		Provider:       "openai-codex",
+		Provider:       "openai-chatgpt",
 		AuthProfile:    "chatgpt",
 		OpenAIBaseURL:  "https://example.test",
 		Model:          "gpt-4.1-mini",
@@ -656,7 +805,7 @@ func TestCallModelUsesChatGPTCodexResponsesForOAuth(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := saveAuthProfiles(AuthProfiles{Profiles: map[string]AuthProfile{
 		"chatgpt": {
-			Provider:    "openai-codex",
+			Provider:    "openai-chatgpt",
 			AuthType:    "oauth",
 			AccessToken: "oauth-access-token",
 			AccountID:   "account-123",
@@ -706,7 +855,7 @@ func TestCallModelUsesChatGPTCodexResponsesForOAuth(t *testing.T) {
 	})}
 
 	msg, err := callModel(context.Background(), Config{
-		Provider:             "openai-codex",
+		Provider:             "openai-chatgpt",
 		AuthProfile:          "chatgpt",
 		ChatGPTCodexBaseURL:  "https://chatgpt.test/backend-api/codex",
 		Model:                "gpt-5",
@@ -749,6 +898,62 @@ func TestParseResponsesStreamTextDeltas(t *testing.T) {
 	msg := chatMessageFromResponses(out)
 	if msg.Content != "hello world" {
 		t.Fatalf("content = %q", msg.Content)
+	}
+}
+
+func TestParseResponsesStreamReasoningSummary(t *testing.T) {
+	out, err := parseResponsesStream([]byte(strings.Join([]string{
+		`data: {"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"inspected context"}]}}`,
+		``,
+		`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+		``,
+	}, "\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := chatMessageFromResponses(out)
+	if msg.Content != "done" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if reasoning := reasoningTextFromMessage(msg); reasoning != "inspected context" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+}
+
+func TestAssistantMsgPublishesReasoningBeforeContentWhenConfigured(t *testing.T) {
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	m := model{
+		cfg:         Config{SystemPrompt: "system", RecentHistoryMessages: 10, IncludeReasoningInContext: true},
+		sessionPath: sessionPath,
+		messages:    []ChatMessage{{Role: "system", Content: "system"}, {Role: "user", Content: "question"}},
+		busy:        true,
+	}
+	updated, cmd := m.Update(assistantMsg{
+		msg: ChatMessage{
+			Role:     "assistant",
+			Thinking: json.RawMessage(`"thought through it"`),
+			Content:  "answer",
+		},
+	})
+	if cmd != nil {
+		t.Fatal("assistant message should not start async work")
+	}
+	got := updated.(model)
+	if len(got.messages) != 4 {
+		t.Fatalf("messages = %#v", got.messages)
+	}
+	if got.messages[2].Role != "assistant" || got.messages[2].Content != "thought through it" {
+		t.Fatalf("reasoning message = %#v", got.messages[2])
+	}
+	if got.messages[3].Role != "assistant" || got.messages[3].Content != "answer" || len(got.messages[3].Thinking) != 0 {
+		t.Fatalf("content message = %#v", got.messages[3])
+	}
+	if len(got.logs) < 2 || got.logs[0].Text != "thought through it" || got.logs[1].Text != "answer" {
+		t.Fatalf("logs = %#v", got.logs)
+	}
+	context := got.contextMessages()
+	if len(context) < 4 || context[len(context)-2].Content != "thought through it" || context[len(context)-1].Content != "answer" {
+		t.Fatalf("context = %#v", context)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,8 +35,11 @@ const (
 	authProfilesFile            = "auth-profiles.json"
 	maxToolResultBytes          = 1024 * 1024
 	maxContextToolResultBytes   = 64 * 1024
+	providerOpenAI              = "openai"
+	providerOpenAICompat        = "openai-compat"
+	providerOpenAIChatGPT       = "openai-chatgpt"
 	defaultAuthProfile          = "openai-api-key:default"
-	defaultChatGPTAuthProfile   = "openai-codex:default"
+	defaultChatGPTAuthProfile   = "openai-chatgpt:default"
 	defaultChatGPTIssuer        = "https://auth.openai.com"
 	defaultChatGPTCodexBaseURL  = "https://chatgpt.com/backend-api/codex"
 	defaultChatGPTOAuthClient   = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -44,22 +48,23 @@ const (
 )
 
 type Config struct {
-	Model                 string   `yaml:"model"`
-	Provider              string   `yaml:"provider"`
-	AuthProfile           string   `yaml:"auth_profile"`
-	PreferredModels       []string `yaml:"preferred_models"`
-	ReasoningLevel        string   `yaml:"reasoning_level"`
-	Fast                  bool     `yaml:"fast"`
-	OllamaURL             string   `yaml:"ollama_url"`
-	OpenAIBaseURL         string   `yaml:"openai_base_url"`
-	OpenAIAPIKeyEnv       string   `yaml:"openai_api_key_env"`
-	ChatGPTIssuer         string   `yaml:"chatgpt_issuer"`
-	ChatGPTCodexBaseURL   string   `yaml:"chatgpt_codex_base_url"`
-	ChatGPTOAuthClientID  string   `yaml:"chatgpt_oauth_client_id"`
-	ChatGPTWorkspaceID    string   `yaml:"chatgpt_workspace_id"`
-	RecentHistoryMessages int      `yaml:"recent_history_messages"`
-	ApprovedTools         []string `yaml:"approved_tools"`
-	SystemPrompt          string   `yaml:"system_prompt"`
+	Model                     string   `yaml:"model"`
+	Provider                  string   `yaml:"provider"`
+	AuthProfile               string   `yaml:"auth_profile"`
+	PreferredModels           []string `yaml:"preferred_models"`
+	ReasoningLevel            string   `yaml:"reasoning_level"`
+	IncludeReasoningInContext bool     `yaml:"include_reasoning_in_context"`
+	Fast                      bool     `yaml:"fast"`
+	OllamaURL                 string   `yaml:"ollama_url"`
+	OpenAIBaseURL             string   `yaml:"openai_base_url"`
+	OpenAIAPIKeyEnv           string   `yaml:"openai_api_key_env"`
+	ChatGPTIssuer             string   `yaml:"chatgpt_issuer"`
+	ChatGPTCodexBaseURL       string   `yaml:"chatgpt_codex_base_url"`
+	ChatGPTOAuthClientID      string   `yaml:"chatgpt_oauth_client_id"`
+	ChatGPTWorkspaceID        string   `yaml:"chatgpt_workspace_id"`
+	RecentHistoryMessages     int      `yaml:"recent_history_messages"`
+	ApprovedTools             []string `yaml:"approved_tools"`
+	SystemPrompt              string   `yaml:"system_prompt"`
 }
 
 type AuthProfiles struct {
@@ -102,11 +107,14 @@ type OllamaTagsResponse struct {
 }
 
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolName   string     `json:"tool_name,omitempty"`
+	Role             string          `json:"role"`
+	Content          string          `json:"content"`
+	ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
+	ToolCallID       string          `json:"tool_call_id,omitempty"`
+	ToolName         string          `json:"tool_name,omitempty"`
+	Thinking         json.RawMessage `json:"thinking,omitempty"`
+	Reasoning        json.RawMessage `json:"reasoning,omitempty"`
+	ReasoningSummary json.RawMessage `json:"reasoning_summary,omitempty"`
 }
 
 type ToolCall struct {
@@ -135,6 +143,7 @@ type ToolFunctionSpec struct {
 type OllamaRequest struct {
 	Model    string        `json:"model"`
 	Stream   bool          `json:"stream"`
+	Think    bool          `json:"think,omitempty"`
 	Messages []ChatMessage `json:"messages"`
 	Tools    []ToolSchema  `json:"tools"`
 }
@@ -220,6 +229,7 @@ type responsesOutputItem struct {
 	Type      string                 `json:"type"`
 	Role      string                 `json:"role,omitempty"`
 	Content   []responsesContentPart `json:"content,omitempty"`
+	Summary   []responsesContentPart `json:"summary,omitempty"`
 	CallID    string                 `json:"call_id,omitempty"`
 	Name      string                 `json:"name,omitempty"`
 	Arguments string                 `json:"arguments,omitempty"`
@@ -416,20 +426,21 @@ func main() {
 
 func loadConfig() (Config, string, error) {
 	cfg := Config{
-		Model:                 "gpt-4.1-mini",
-		Provider:              "openai",
-		AuthProfile:           defaultAuthProfile,
-		PreferredModels:       defaultPreferredModels(),
-		ReasoningLevel:        "medium",
-		Fast:                  false,
-		OllamaURL:             "http://localhost:11434",
-		OpenAIBaseURL:         "https://api.openai.com/v1",
-		OpenAIAPIKeyEnv:       "OPENAI_API_KEY",
-		ChatGPTIssuer:         defaultChatGPTIssuer,
-		ChatGPTCodexBaseURL:   defaultChatGPTCodexBaseURL,
-		ChatGPTOAuthClientID:  defaultChatGPTOAuthClient,
-		RecentHistoryMessages: 10,
-		SystemPrompt:          "You are codegollm, a minimal local coding agent with read, write, edit, and bash tools.",
+		Model:                     "gpt-4.1-mini",
+		Provider:                  providerOpenAI,
+		AuthProfile:               defaultAuthProfile,
+		PreferredModels:           defaultPreferredModels(),
+		ReasoningLevel:            "medium",
+		IncludeReasoningInContext: false,
+		Fast:                      false,
+		OllamaURL:                 "http://localhost:11434",
+		OpenAIBaseURL:             "https://api.openai.com/v1",
+		OpenAIAPIKeyEnv:           "OPENAI_API_KEY",
+		ChatGPTIssuer:             defaultChatGPTIssuer,
+		ChatGPTCodexBaseURL:       defaultChatGPTCodexBaseURL,
+		ChatGPTOAuthClientID:      defaultChatGPTOAuthClient,
+		RecentHistoryMessages:     10,
+		SystemPrompt:              "You are codegollm, a minimal local coding agent with read, write, edit, and bash tools.",
 	}
 	path := findConfigPath()
 	data, err := os.ReadFile(path)
@@ -447,7 +458,7 @@ func loadConfig() (Config, string, error) {
 		cfg.Model = "gpt-4.1-mini"
 	}
 	if cfg.Provider == "" {
-		cfg.Provider = "openai"
+		cfg.Provider = providerOpenAI
 	}
 	if cfg.AuthProfile == "" {
 		cfg.AuthProfile = defaultAuthProfile
@@ -659,7 +670,7 @@ func defaultAuthProfiles() map[string]AuthProfile {
 	now := time.Now().UTC()
 	return map[string]AuthProfile{
 		defaultAuthProfile: {
-			Provider:  "openai",
+			Provider:  providerOpenAI,
 			AuthType:  "api_key_env",
 			Env:       "OPENAI_API_KEY",
 			CreatedAt: now,
@@ -695,7 +706,7 @@ func registerEnvAPIKeyProfile(id, envName string) error {
 	if profile.CreatedAt.IsZero() {
 		profile.CreatedAt = now
 	}
-	profile.Provider = "openai"
+	profile.Provider = providerOpenAI
 	profile.AuthType = "api_key_env"
 	profile.Env = envName
 	profile.UpdatedAt = now
@@ -715,7 +726,7 @@ func deleteAuthProfile(id string) error {
 func resolveAuth(ctx context.Context, cfg Config) (resolvedAuth, error) {
 	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
 	if provider == "" {
-		provider = "openai"
+		provider = providerOpenAI
 	}
 	if provider == "ollama" {
 		return resolvedAuth{Provider: "ollama"}, nil
@@ -726,7 +737,7 @@ func resolveAuth(ctx context.Context, cfg Config) (resolvedAuth, error) {
 	}
 	profileID := strings.TrimSpace(cfg.AuthProfile)
 	if profileID == "" {
-		if provider == "openai-codex" {
+		if provider == providerOpenAIChatGPT {
 			profileID = defaultChatGPTAuthProfile
 		} else {
 			profileID = defaultAuthProfile
@@ -734,7 +745,7 @@ func resolveAuth(ctx context.Context, cfg Config) (resolvedAuth, error) {
 	}
 	profile, ok := store.Profiles[profileID]
 	if !ok {
-		return resolvedAuth{}, fmt.Errorf("auth profile %q not found; run /login openai-api-key or /login openai-codex", profileID)
+		return resolvedAuth{}, fmt.Errorf("auth profile %q not found; run /login openai-api-key or /login openai-chatgpt", profileID)
 	}
 	switch profile.AuthType {
 	case "api_key_env":
@@ -746,12 +757,12 @@ func resolveAuth(ctx context.Context, cfg Config) (resolvedAuth, error) {
 		if apiKey == "" {
 			return resolvedAuth{}, fmt.Errorf("missing OpenAI API key: set %s in your shell environment", envName)
 		}
-		return resolvedAuth{ProfileID: profileID, Provider: "openai", APIKey: apiKey}, nil
+		return resolvedAuth{ProfileID: profileID, Provider: providerOpenAI, APIKey: apiKey}, nil
 	case "api_key":
 		if strings.TrimSpace(profile.APIKey) == "" {
 			return resolvedAuth{}, fmt.Errorf("auth profile %q has no API key", profileID)
 		}
-		return resolvedAuth{ProfileID: profileID, Provider: "openai", APIKey: strings.TrimSpace(profile.APIKey)}, nil
+		return resolvedAuth{ProfileID: profileID, Provider: providerOpenAI, APIKey: strings.TrimSpace(profile.APIKey)}, nil
 	case "oauth":
 		updated, changed, err := refreshOAuthProfileIfNeeded(ctx, cfg, profile)
 		if err != nil {
@@ -765,14 +776,14 @@ func resolveAuth(ctx context.Context, cfg Config) (resolvedAuth, error) {
 			profile = updated
 		}
 		if strings.TrimSpace(profile.APIKey) != "" {
-			return resolvedAuth{ProfileID: profileID, Provider: "openai", APIKey: strings.TrimSpace(profile.APIKey), AccountID: profile.AccountID}, nil
+			return resolvedAuth{ProfileID: profileID, Provider: providerOpenAI, APIKey: strings.TrimSpace(profile.APIKey), AccountID: profile.AccountID}, nil
 		}
 		if strings.TrimSpace(profile.AccessToken) == "" {
 			return resolvedAuth{}, fmt.Errorf("auth profile %q has no access token", profileID)
 		}
 		return resolvedAuth{
 			ProfileID:   profileID,
-			Provider:    "openai-codex",
+			Provider:    providerOpenAIChatGPT,
 			BearerToken: strings.TrimSpace(profile.AccessToken),
 			AccountID:   profile.AccountID,
 		}, nil
@@ -874,7 +885,7 @@ func chatGPTWorkspaceHint(profileID, idToken string) string {
 		if org.IsDefault {
 			label += " default"
 		}
-		parts = append(parts, "/login openai-codex "+profileID+" "+org.ID+" for "+label)
+		parts = append(parts, "/login openai-chatgpt "+profileID+" "+org.ID+" for "+label)
 	}
 	return " Choose a workspace and rerun " + strings.Join(parts, " or ") + "."
 }
@@ -955,7 +966,7 @@ func profileFromOAuthTokens(profile AuthProfile, tokens oauthTokenResponse) Auth
 	if profile.CreatedAt.IsZero() {
 		profile.CreatedAt = now
 	}
-	profile.Provider = "openai-codex"
+	profile.Provider = providerOpenAIChatGPT
 	profile.AuthType = "oauth"
 	if tokens.IDToken != "" {
 		profile.IDToken = tokens.IDToken
@@ -1633,6 +1644,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.busy = false
+		if reasoning := reasoningTextFromMessage(msg.msg); m.cfg.IncludeReasoningInContext && reasoning != "" {
+			reasoningMsg := ChatMessage{Role: "assistant", Content: reasoning}
+			m.messages = append(m.messages, reasoningMsg)
+			m.logs = append(m.logs, logLine{Kind: "assistant", Text: reasoning})
+		}
+		msg.msg = clearReasoningMetadata(msg.msg)
 		m.messages = append(m.messages, msg.msg)
 		if msg.msg.Content != "" {
 			m.logs = append(m.logs, logLine{Kind: "assistant", Text: msg.msg.Content})
@@ -2150,7 +2167,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/login":
 		if len(fields) < 2 {
-			m.logs = append(m.logs, logLine{Kind: "system", Text: "usage: /login openai-codex [profile] [workspace_id] or /login openai-api-key [profile] [env]"})
+			m.logs = append(m.logs, logLine{Kind: "system", Text: "usage: /login openai-chatgpt [profile] [workspace_id] or /login openai-api-key [profile] [env]"})
 			return m, nil
 		}
 		kind := strings.ToLower(fields[1])
@@ -2168,7 +2185,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 				m.logs = append(m.logs, logLine{Kind: "error", Text: err.Error()})
 				return m, nil
 			}
-			m.cfg.Provider = "openai"
+			m.cfg.Provider = providerOpenAI
 			m.cfg.AuthProfile = profileID
 			m.cfg.OpenAIAPIKeyEnv = envName
 			if err := saveConfig(m.configPath, m.cfg); err != nil {
@@ -2177,7 +2194,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 			}
 			m.logs = append(m.logs, logLine{Kind: "system", Text: fmt.Sprintf("using OpenAI API key profile %s from env %s", profileID, envName)})
 			return m, nil
-		case "openai-codex", "chatgpt":
+		case providerOpenAIChatGPT:
 			profileID := defaultChatGPTAuthProfile
 			if len(fields) >= 3 {
 				profileID = fields[2]
@@ -2191,7 +2208,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 				m.logs = append(m.logs, logLine{Kind: "error", Text: err.Error()})
 				return m, nil
 			}
-			m.cfg.Provider = "openai-codex"
+			m.cfg.Provider = providerOpenAIChatGPT
 			m.cfg.AuthProfile = login.ProfileID
 			if workspaceID != "" {
 				m.cfg.ChatGPTWorkspaceID = workspaceID
@@ -2222,7 +2239,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.cfg.AuthProfile == profileID {
-			m.cfg.Provider = "openai"
+			m.cfg.Provider = providerOpenAI
 			m.cfg.AuthProfile = defaultAuthProfile
 			if err := saveConfig(m.configPath, m.cfg); err != nil {
 				m.logs = append(m.logs, logLine{Kind: "error", Text: "profile removed but config save failed: " + err.Error()})
@@ -2291,7 +2308,7 @@ func (m model) handleSlashCommand(prompt string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "/help":
-		m.logs = append(m.logs, logLine{Kind: "system", Text: "commands: /auth, /login openai-codex [profile] [workspace_id], /login openai-api-key [profile] [env], /logout [profile], /model, /model all, /model auto, /reasoning [none|minimal|low|medium|high|xhigh], /fast [on|off|toggle], /help"})
+		m.logs = append(m.logs, logLine{Kind: "system", Text: "commands: /auth, /login openai-chatgpt [profile] [workspace_id], /login openai-api-key [profile] [env], /logout [profile], /model, /model all, /model auto, /reasoning [none|minimal|low|medium|high|xhigh], /fast [on|off|toggle], /help"})
 		return m, nil
 	default:
 		m.logs = append(m.logs, logLine{Kind: "error", Text: "unknown command: " + cmd})
@@ -2792,9 +2809,11 @@ func formatMessageForSummary(msg ChatMessage) string {
 
 func callModel(ctx context.Context, cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
-	case "", "openai":
+	case "", providerOpenAI:
+		return callOpenAIResponses(ctx, cfg, messages, tools)
+	case providerOpenAICompat:
 		return callOpenAI(ctx, cfg, messages, tools)
-	case "openai-codex":
+	case providerOpenAIChatGPT:
 		return callChatGPTCodexResponses(ctx, cfg, messages, tools)
 	case "ollama":
 		return callOllama(ctx, cfg, messages, tools)
@@ -2803,13 +2822,90 @@ func callModel(ctx context.Context, cfg Config, messages []ChatMessage, tools []
 	}
 }
 
+func callOpenAIResponses(ctx context.Context, cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
+	auth, err := resolveAuth(ctx, cfg)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if auth.APIKey == "" {
+		return ChatMessage{}, errors.New("OpenAI Responses provider requires an API key auth profile")
+	}
+	modelName := strings.TrimSpace(cfg.Model)
+	if modelName == "" || strings.EqualFold(modelName, "auto") {
+		models, err := listOpenAIModels(ctx, cfg)
+		if err != nil {
+			return ChatMessage{}, err
+		}
+		modelName = recommendedModel(cfg, models)
+		if modelName == "" {
+			return ChatMessage{}, errors.New("no suitable OpenAI model found")
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	request := responsesRequest{
+		Model:             modelName,
+		Instructions:      responsesInstructions(messages),
+		Input:             responsesInput(messages),
+		Tools:             responsesTools(tools),
+		ToolChoice:        "auto",
+		ParallelToolCalls: false,
+		Store:             false,
+		Stream:            true,
+	}
+	if effort := reasoningEffortForRequest(cfg, modelName); effort != "" {
+		request.Reasoning = &responsesReasoning{Effort: effort}
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.OpenAIBaseURL, "/")+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if err := setOpenAIAuthHeaders(req, auth); err != nil {
+		return ChatMessage{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if resp.StatusCode >= 300 {
+		var out responsesResponse
+		_ = json.Unmarshal(data, &out)
+		if out.Error != nil && out.Error.Message != "" {
+			return ChatMessage{}, fmt.Errorf("openai responses status %d: %s", resp.StatusCode, out.Error.Message)
+		}
+		return ChatMessage{}, fmt.Errorf("openai responses status %d: %s", resp.StatusCode, string(data))
+	}
+	out, err := parseResponsesStream(data)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if out.Error != nil && out.Error.Message != "" {
+		return ChatMessage{}, errors.New(out.Error.Message)
+	}
+	msg := chatMessageFromResponses(out)
+	if msg.Content == "" && len(msg.ToolCalls) == 0 {
+		return ChatMessage{}, errors.New("openai responses returned no output")
+	}
+	return msg, nil
+}
+
 func callOpenAI(ctx context.Context, cfg Config, messages []ChatMessage, tools []ToolSchema) (ChatMessage, error) {
 	auth, err := resolveAuth(ctx, cfg)
 	if err != nil {
 		return ChatMessage{}, err
 	}
-	if auth.Provider == "openai-codex" && auth.APIKey == "" {
-		return ChatMessage{}, errors.New("ChatGPT OAuth profiles use the Responses backend; call the openai-codex provider through callModel")
+	if auth.Provider == providerOpenAIChatGPT && auth.APIKey == "" {
+		return ChatMessage{}, errors.New("ChatGPT OAuth profiles use the Responses backend; call the openai-chatgpt provider through callModel")
 	}
 	modelName := strings.TrimSpace(cfg.Model)
 	if modelName == "" || strings.EqualFold(modelName, "auto") {
@@ -3041,6 +3137,7 @@ func responsesTools(tools []ToolSchema) []responsesTool {
 func parseResponsesStream(data []byte) (responsesResponse, error) {
 	var out responsesResponse
 	var textDeltas []string
+	var reasoningDeltas []string
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	var eventLines []string
@@ -3077,6 +3174,10 @@ func parseResponsesStream(data []byte) (responsesResponse, error) {
 			if event.Delta != "" {
 				textDeltas = append(textDeltas, event.Delta)
 			}
+		case "response.reasoning_summary_text.delta":
+			if event.Delta != "" {
+				reasoningDeltas = append(reasoningDeltas, event.Delta)
+			}
 		}
 		return nil
 	}
@@ -3108,12 +3209,22 @@ func parseResponsesStream(data []byte) (responsesResponse, error) {
 			}},
 		})
 	}
+	if len(reasoningDeltas) > 0 {
+		out.Output = append(out.Output, responsesOutputItem{
+			Type: "reasoning",
+			Summary: []responsesContentPart{{
+				Type: "summary_text",
+				Text: strings.Join(reasoningDeltas, ""),
+			}},
+		})
+	}
 	return out, nil
 }
 
 func chatMessageFromResponses(out responsesResponse) ChatMessage {
 	msg := ChatMessage{Role: "assistant"}
 	var textParts []string
+	var reasoningParts []string
 	for _, item := range out.Output {
 		switch item.Type {
 		case "message":
@@ -3122,6 +3233,9 @@ func chatMessageFromResponses(out responsesResponse) ChatMessage {
 					textParts = append(textParts, part.Text)
 				}
 			}
+		case "reasoning":
+			reasoningParts = append(reasoningParts, textFromContentParts(item.Summary)...)
+			reasoningParts = append(reasoningParts, textFromContentParts(item.Content)...)
 		case "function_call":
 			args := strings.TrimSpace(item.Arguments)
 			if args == "" {
@@ -3138,7 +3252,87 @@ func chatMessageFromResponses(out responsesResponse) ChatMessage {
 		}
 	}
 	msg.Content = strings.Join(textParts, "\n")
+	if reasoning := strings.TrimSpace(strings.Join(reasoningParts, "\n")); reasoning != "" {
+		msg.ReasoningSummary = json.RawMessage(strconv.Quote(reasoning))
+	}
 	return msg
+}
+
+func reasoningTextFromMessage(msg ChatMessage) string {
+	parts := []string{
+		rawTextValue(msg.Thinking),
+		rawTextValue(msg.ReasoningSummary),
+		rawTextValue(msg.Reasoning),
+	}
+	var out []string
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			out = append(out, strings.TrimSpace(part))
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func clearReasoningMetadata(msg ChatMessage) ChatMessage {
+	msg.Thinking = nil
+	msg.Reasoning = nil
+	msg.ReasoningSummary = nil
+	return msg
+}
+
+func rawTextValue(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+	var parts []string
+	collectRawText(raw, &parts)
+	return strings.Join(parts, "\n")
+}
+
+func collectRawText(raw json.RawMessage, out *[]string) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return
+	}
+	collectTextValue(value, out)
+}
+
+func collectTextValue(value any, out *[]string) {
+	switch value := value.(type) {
+	case string:
+		if strings.TrimSpace(value) != "" {
+			*out = append(*out, value)
+		}
+	case []any:
+		for _, item := range value {
+			collectTextValue(item, out)
+		}
+	case map[string]any:
+		for _, key := range []string{"text", "summary_text", "content"} {
+			if nested, ok := value[key]; ok {
+				collectTextValue(nested, out)
+			}
+		}
+		for _, key := range []string{"summary", "reasoning", "thinking"} {
+			if nested, ok := value[key]; ok {
+				collectTextValue(nested, out)
+			}
+		}
+	}
+}
+
+func textFromContentParts(parts []responsesContentPart) []string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part.Text) != "" {
+			out = append(out, part.Text)
+		}
+	}
+	return out
 }
 
 func reasoningEffortForRequest(cfg Config, modelName string) string {
@@ -3276,6 +3470,7 @@ func callOllama(ctx context.Context, cfg Config, messages []ChatMessage, tools [
 	body, err := json.Marshal(OllamaRequest{
 		Model:    cfg.Model,
 		Stream:   false,
+		Think:    ollamaThinkingEnabled(cfg),
 		Messages: messages,
 		Tools:    tools,
 	})
@@ -3307,6 +3502,11 @@ func callOllama(ctx context.Context, cfg Config, messages []ChatMessage, tools [
 		return ChatMessage{}, errors.New(out.Error)
 	}
 	return out.Message, nil
+}
+
+func ollamaThinkingEnabled(cfg Config) bool {
+	level := strings.ToLower(strings.TrimSpace(cfg.ReasoningLevel))
+	return level != "" && level != "none"
 }
 
 func listModelsCmd(ctx context.Context, cfg Config, runID int, all bool) tea.Cmd {
@@ -3342,7 +3542,7 @@ func listProviderModels(ctx context.Context, cfg Config, all bool) ([]string, st
 			models = curateModelChoices(cfg, models, firstModel(models), 15)
 		}
 		return models, firstModel(models), total, nil
-	case "openai-codex":
+	case providerOpenAIChatGPT:
 		models := codexModels()
 		recommended := recommendedModel(cfg, models)
 		ordered := orderOpenAIModels(cfg, models, recommended)
@@ -3351,7 +3551,7 @@ func listProviderModels(ctx context.Context, cfg Config, all bool) ([]string, st
 			ordered = curateModelChoices(cfg, ordered, recommended, 15)
 		}
 		return ordered, recommended, total, nil
-	case "", "openai":
+	case "", providerOpenAI, providerOpenAICompat:
 		models, err := listOpenAIModels(ctx, cfg)
 		if err != nil {
 			return nil, "", 0, err
@@ -3678,7 +3878,7 @@ func firstModel(models []string) string {
 func providerName(cfg Config) string {
 	provider := strings.TrimSpace(cfg.Provider)
 	if provider == "" {
-		return "openai"
+		return providerOpenAI
 	}
 	return provider
 }
