@@ -3210,7 +3210,7 @@ func parseResponsesStream(data []byte) (responsesResponse, error) {
 			}},
 		})
 	}
-	if len(reasoningDeltas) > 0 {
+	if len(reasoningDeltas) > 0 && !hasResponsesOutputType(out.Output, "reasoning") {
 		out.Output = append(out.Output, responsesOutputItem{
 			Type: "reasoning",
 			Summary: []responsesContentPart{{
@@ -3220,6 +3220,15 @@ func parseResponsesStream(data []byte) (responsesResponse, error) {
 		})
 	}
 	return out, nil
+}
+
+func hasResponsesOutputType(items []responsesOutputItem, itemType string) bool {
+	for _, item := range items {
+		if item.Type == itemType {
+			return true
+		}
+	}
+	return false
 }
 
 func chatMessageFromResponses(out responsesResponse) ChatMessage {

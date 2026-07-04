@@ -920,6 +920,24 @@ func TestParseResponsesStreamReasoningSummary(t *testing.T) {
 	}
 }
 
+func TestParseResponsesStreamDoesNotDuplicateReasoningSummaryDeltas(t *testing.T) {
+	out, err := parseResponsesStream([]byte(strings.Join([]string{
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"inspected context"}`,
+		``,
+		`data: {"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"inspected context"}]}}`,
+		``,
+		`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+		``,
+	}, "\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := chatMessageFromResponses(out)
+	if reasoning := reasoningTextFromMessage(msg); reasoning != "inspected context" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+}
+
 func TestAssistantMsgPublishesReasoningBeforeContentWhenConfigured(t *testing.T) {
 	sessionPath := filepath.Join(t.TempDir(), "session.json")
 	m := model{
