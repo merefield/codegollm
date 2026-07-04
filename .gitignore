@@ -2,3 +2,4 @@
 .gomodcache/
 codegollm
 .env
+.codegollm/

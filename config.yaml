@@ -1,5 +1,5 @@
-provider: openai
-model: gpt-4.1-mini
+provider: ollama
+model: gemma4:latest
 auth_profile: openai-api-key:default
 preferred_models:
   - gpt-5.5
@@ -12,11 +12,12 @@ preferred_models:
   - gpt-4.1
   - gpt-4.1-mini
 reasoning_level: medium
+include_reasoning_in_context: true
 fast: false
 openai_base_url: https://api.openai.com/v1
 openai_api_key_env: OPENAI_API_KEY
 chatgpt_issuer: https://auth.openai.com
-chatgpt_oauth_client_id: app_EMoamEEZ73f0CkXaXp7hrann
+chatgpt_oauth_client_id:
 ollama_url: http://localhost:11434
 recent_history_messages: 10
 approved_tools: []
