@@ -30,6 +30,7 @@ import (
 )
 
 const (
+	appVersion                  = "0.5.0"
 	configFile                  = "config.yaml"
 	sessionFile                 = ".codegollm/session.json"
 	authProfilesFile            = "auth-profiles.json"
@@ -1763,7 +1764,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("CodeGollm"))
+	b.WriteString(titleStyle.Render("CodeGollm " + appVersion))
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("root: %s | provider: %s | model: %s | saved approvals: %d\n\n", m.root, m.cfg.Provider, m.cfg.Model, len(m.cfg.ApprovedTools)))
 

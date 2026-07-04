@@ -1,5 +1,7 @@
 # CodeGollm
 
+Current version: `0.5.0`
+
 `codegollm` is a minimal Go/Bubble Tea coding TUI. It supports OpenAI API-key auth, ChatGPT OAuth via the ChatGPT/Codex Responses backend, and local Ollama models.
 
 It exposes four model tools:
