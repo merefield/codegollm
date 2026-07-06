@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	appVersion                  = "0.5.0"
+	appVersion                  = "0.5.1"
 	configFile                  = "config.yaml"
 	sessionFile                 = ".codegollm/session.json"
 	authProfilesFile            = "auth-profiles.json"
@@ -1667,6 +1667,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"You are the coding agent. Continue by using your tools to inspect the workspace, write the needed code, and run relevant checks.",
 					"Use project lint, format, and test commands when available; add suitable lint tooling if the project lacks it and the language warrants it.",
 					"Only ask a question if the requirement is genuinely ambiguous and cannot be resolved by reading files or making a reasonable implementation choice.",
+					"Always test a change after making it, preferably with automated tests.  If those pass run the whole suite.  Run the code yourself if the environment allows and you can inspect the results.  Fix errors that occur.  Examine tool output for errors and follow up to fix them.  Always rerun tests you edit.",
 				}, " "),
 			}
 			m.messages = append(m.messages, nudge)

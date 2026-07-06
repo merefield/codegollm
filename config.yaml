@@ -1,5 +1,5 @@
-provider: ollama
-model: gemma4:latest
+provider: openai
+model: gpt-5.4-mini
 auth_profile: openai-api-key:default
 preferred_models:
   - gpt-5.5
